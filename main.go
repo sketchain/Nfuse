@@ -15,6 +15,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -23,6 +24,14 @@ import (
 	"github.com/sketchain/nfuse/internal/store"
 	"github.com/sketchain/nfuse/internal/system"
 	"github.com/sketchain/nfuse/internal/tui"
+)
+
+// Build metadata, overridable at link time via
+// -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 func main() {
@@ -36,8 +45,14 @@ func main() {
 		headless    = flag.Bool("headless", false, "run without the TUI (control plane only)")
 		teardown    = flag.Bool("teardown", false, "remove the nftables ruleset and exit")
 		skipKernChk = flag.Bool("skip-kernel-check", false, "skip the netdev egress kernel version check")
+		showVer     = flag.Bool("version", false, "print version information and exit")
 	)
 	flag.Parse()
+
+	if *showVer {
+		fmt.Printf("nfuse %s (commit %s, built %s, %s)\n", version, commit, date, runtime.Version())
+		return
+	}
 
 	logger := log.New(os.Stderr, "nfuse: ", log.LstdFlags)
 
