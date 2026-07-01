@@ -52,6 +52,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -70,6 +71,11 @@ type Manager interface {
 	Sample() (Sample, error)
 	// ResetQuota zeroes one account's named quota in the kernel.
 	ResetQuota(accountID int64) error
+	// TableExists reports whether the managed netdev table is currently present
+	// in the kernel. It distinguishes a cold start (table absent, machine
+	// rebooted) from a hot restart (table still live with fresher-than-SQLite
+	// accounting), so the engine can pick the authoritative data source.
+	TableExists() (bool, error)
 	// Teardown removes the managed table entirely.
 	Teardown() error
 }
@@ -202,6 +208,25 @@ func (m *execManager) ResetQuota(accountID int64) error {
 		return fmt.Errorf("reset quota %s: %v: %s", quotaName(accountID), err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+func (m *execManager) TableExists() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "nft", "list", "table", "netdev", m.table)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		// A non-zero exit means nft ran but the table is absent ("No such file
+		// or directory"). Any other failure (binary missing, timeout) is a real
+		// error the caller must see rather than misread as a cold start.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return false, nil
+		}
+		return false, fmt.Errorf("nft list table: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return true, nil
 }
 
 func (m *execManager) Teardown() error {

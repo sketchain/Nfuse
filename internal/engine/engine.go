@@ -33,11 +33,13 @@ type Controller struct {
 	sampleInterval  time.Duration
 	persistInterval time.Duration
 
-	mu      sync.Mutex // guards snap and live
-	snap    model.Snapshot
-	live    nft.Sample // latest kernel reading
-	logf    func(string, ...any)
-	lastErr string
+	mu          sync.Mutex // guards snap, live, lastPersist
+	snap        model.Snapshot
+	live        nft.Sample // latest kernel reading
+	logf        func(string, ...any)
+	lastErr     string
+	startedAt   time.Time // process start (for health uptime)
+	lastPersist time.Time // last successful SQLite snapshot
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -68,19 +70,67 @@ func New(st *store.Store, mgr nft.Manager, opts Options) (*Controller, error) {
 		sampleInterval:  opts.SampleInterval,
 		persistInterval: opts.PersistInterval,
 		logf:            opts.Logf,
+		startedAt:       time.Now(),
 		stopCh:          make(chan struct{}),
 	}
 	snap, err := st.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
 	}
-	c.snap = snap
 	c.live = nft.Sample{Counters: map[model.CounterKey]model.Counter{}, AccountUsed: map[int64]uint64{}}
-	// Seed the kernel from persisted state (backfill after reboot).
+
+	// Cold start vs hot restart: probe whether our kernel table already exists.
+	//
+	//   - Table absent  => cold start (the machine rebooted, kernel state is
+	//     empty). SQLite is authoritative: build the table seeding counters and
+	//     quotas from the persisted snapshot.
+	//   - Table present => hot restart (this process was relaunched, e.g. by
+	//     systemd Restart=on-failure, while the box stayed up). The kernel still
+	//     holds live usage newer than SQLite, so the kernel is authoritative: we
+	//     sample the live values, fold them into the snapshot (and SQLite), and
+	//     rebuild seeding from those — never letting stale SQLite overwrite them.
+	exists, err := c.nft.TableExists()
+	if err != nil {
+		return nil, fmt.Errorf("probe kernel table: %w", err)
+	}
+	if exists {
+		if err := c.adoptLiveState(&snap); err != nil {
+			return nil, err
+		}
+	}
+	c.snap = snap
 	if err := c.nft.Apply(snap); err != nil {
 		return nil, fmt.Errorf("apply initial ruleset: %w", err)
 	}
 	return c, nil
+}
+
+// adoptLiveState samples the live kernel counters/quotas (hot restart) and folds
+// them over the persisted snapshot so the rebuild reseeds from current reality,
+// also persisting them back to SQLite so the DB reflects the kernel truth.
+func (c *Controller) adoptLiveState(snap *model.Snapshot) error {
+	s, err := c.nft.Sample()
+	if err != nil {
+		return fmt.Errorf("sample live state on hot restart: %w", err)
+	}
+	for i := range snap.Accounts {
+		if u, ok := s.AccountUsed[snap.Accounts[i].ID]; ok {
+			snap.Accounts[i].UsedBytes = u
+		}
+	}
+	for k, v := range s.Counters {
+		snap.Counters[k] = v
+	}
+	c.live = s
+	// Fold the adopted live values into SQLite so a later reconcile (and the DB
+	// on disk) start from the kernel's newer numbers, not the stale snapshot.
+	if len(s.AccountUsed) > 0 || len(s.Counters) > 0 {
+		if err := c.store.PersistUsage(s.AccountUsed, s.Counters); err != nil {
+			return fmt.Errorf("persist adopted live state: %w", err)
+		}
+		c.lastPersist = time.Now()
+	}
+	return nil
 }
 
 // Start launches the background sampling, persistence and reset loops.
@@ -174,7 +224,23 @@ func (c *Controller) persistNow() error {
 	if len(used) == 0 && len(counters) == 0 {
 		return nil
 	}
-	return c.store.PersistUsage(used, counters)
+	if err := c.store.PersistUsage(used, counters); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.lastPersist = time.Now()
+	c.mu.Unlock()
+	return nil
+}
+
+// ForcePersist triggers an immediate SQLite snapshot (the ForcePersist RPC).
+func (c *Controller) ForcePersist() error { return c.persistNow() }
+
+// Stats reports process start and last successful persist times (for health).
+func (c *Controller) Stats() (startedAt, lastPersist time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.startedAt, c.lastPersist
 }
 
 func (c *Controller) setErr(msg string) {
@@ -225,27 +291,31 @@ func (c *Controller) reconcile(mutate func() error) error {
 	return nil
 }
 
-// AddAccount creates an account (and its quota object for tier a/b).
-func (c *Controller) AddAccount(name string, tier model.Tier, limitGiB float64, anchorDay int) error {
+// AddAccount creates an account (and its quota object for tier a/b), returning
+// the new account id.
+func (c *Controller) AddAccount(name string, tier model.Tier, limitGiB float64, anchorDay int) (int64, error) {
 	name, err := model.NormalizeName(name)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !tier.Valid() {
-		return fmt.Errorf("invalid tier %q", tier)
+		return 0, fmt.Errorf("invalid tier %q", tier)
 	}
 	if tier.HasQuota() && limitGiB <= 0 {
-		return fmt.Errorf("tier %s requires a positive limit", tier)
+		return 0, fmt.Errorf("tier %s requires a positive limit", tier)
 	}
 	if anchorDay < 1 || anchorDay > 28 {
 		anchorDay = 1
 	}
-	return c.reconcile(func() error {
-		_, err := c.store.CreateAccount(model.Account{
+	var newID int64
+	err = c.reconcile(func() error {
+		id, err := c.store.CreateAccount(model.Account{
 			Name: name, Tier: tier, LimitGiB: limitGiB, BillingAnchorDay: anchorDay,
 		})
+		newID = id
 		return err
 	})
+	return newID, err
 }
 
 // DeleteAccount removes an account; it must own no ports.
@@ -299,6 +369,59 @@ func (c *Controller) AddPort(accountID int64, port uint16) error {
 // DeletePort removes a port and reclaims its counters/rules.
 func (c *Controller) DeletePort(portID int64) error {
 	return c.reconcile(func() error { return c.store.DeletePort(portID) })
+}
+
+// MovePort reassigns a port to another account. The port keeps its counters;
+// the reconcile re-points its rules at the destination account's quota (or none,
+// if the destination is unlimited).
+func (c *Controller) MovePort(portID, newAccountID int64) error {
+	c.mu.Lock()
+	_, ok := c.snap.Account(newAccountID)
+	var found bool
+	for _, p := range c.snap.Ports {
+		if p.ID == portID {
+			found = true
+			break
+		}
+	}
+	c.mu.Unlock()
+	if !found {
+		return fmt.Errorf("port %d not found", portID)
+	}
+	if !ok {
+		return fmt.Errorf("account %d not found", newAccountID)
+	}
+	return c.reconcile(func() error { return c.store.MovePort(portID, newAccountID) })
+}
+
+// SetUsage overwrites an account's recorded quota usage to an arbitrary target
+// (higher or lower). It updates SQLite and re-seeds the kernel quota to the same
+// value through the standard reconcile path. Because reconcile folds the live
+// (pre-change) value into SQLite *before* running the mutation, the mutation's
+// write is the one that survives into the rebuild — so the seeded quota ends up
+// at exactly the requested target.
+func (c *Controller) SetUsage(id int64, usedBytes uint64) error {
+	c.mu.Lock()
+	acct, ok := c.snap.Account(id)
+	c.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("account %d not found", id)
+	}
+	if !acct.Tier.HasQuota() {
+		return fmt.Errorf("account %q is unlimited and has no usage to set", acct.Name)
+	}
+	return c.reconcile(func() error {
+		if err := c.store.SetUsage(id, usedBytes); err != nil {
+			return err
+		}
+		// Keep the in-memory live view consistent until the next sample re-reads
+		// the freshly re-seeded kernel quota, so an immediately following
+		// reconcile does not fold the stale value back in.
+		if c.live.AccountUsed != nil {
+			c.live.AccountUsed[id] = usedBytes
+		}
+		return nil
+	})
 }
 
 // ResetAccount zeroes a quota account's usage now (manual tier-a reset, also

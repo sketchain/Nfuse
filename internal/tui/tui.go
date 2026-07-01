@@ -15,13 +15,30 @@ import (
 	"github.com/sketchain/nfuse/internal/model"
 )
 
-// UI wires a tview application to an engine.Controller.
+// Controller is the set of operations the UI drives. It is satisfied both by the
+// in-process engine (server role) and by the RPC client (client role), so the
+// TUI is identical whether it talks to a local engine or a remote daemon. All
+// mutations return only an error; the UI re-renders by re-reading View(), which
+// on the client performs a fresh full GetState.
+type Controller interface {
+	View() ([]engine.AccountView, string)
+	AddAccount(name string, tier model.Tier, limitGiB float64, anchorDay int) (int64, error)
+	DeleteAccount(id int64) error
+	SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay int) error
+	AddPort(accountID int64, port uint16) error
+	DeletePort(portID int64) error
+	MovePort(portID, newAccountID int64) error
+	ResetAccount(id int64) error
+	SetUsage(id int64, usedBytes uint64) error
+}
+
+// UI wires a tview application to a Controller.
 type UI struct {
 	app     *tview.Application
 	pages   *tview.Pages
 	table   *tview.Table
 	status  *tview.TextView
-	ctrl    *engine.Controller
+	ctrl    Controller
 	refresh time.Duration
 
 	// rowRef maps a table row index to the object it represents so key actions
@@ -45,7 +62,7 @@ type rowRef struct {
 }
 
 // New builds the UI over the given controller.
-func New(ctrl *engine.Controller, refresh time.Duration) *UI {
+func New(ctrl Controller, refresh time.Duration) *UI {
 	if refresh <= 0 {
 		refresh = time.Second
 	}
@@ -70,7 +87,7 @@ func (u *UI) buildLayout() {
 
 	u.status.SetBorder(true).SetTitle(" status ")
 	help := tview.NewTextView().SetDynamicColors(true)
-	help.SetText("[yellow]a[-] add acct  [yellow]d[-] del acct  [yellow]p[-] add port  [yellow]x[-] del port  [yellow]t[-] tier  [yellow]r[-] reset  [yellow]q[-] quit")
+	help.SetText("[yellow]a[-] add acct  [yellow]d[-] del acct  [yellow]p[-] add port  [yellow]x[-] del port  [yellow]m[-] move port  [yellow]t[-] tier  [yellow]r[-] reset  [yellow]u[-] set usage  [yellow]q[-] quit")
 	help.SetBorder(true).SetTitle(" keys ")
 
 	main := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -187,11 +204,17 @@ func (u *UI) onKey(ev *tcell.EventKey) *tcell.EventKey {
 	case 'x':
 		u.doDeletePort()
 		return nil
+	case 'm':
+		u.formMovePort()
+		return nil
 	case 't':
 		u.formChangeTier()
 		return nil
 	case 'r':
 		u.doReset()
+		return nil
+	case 'u':
+		u.formSetUsage()
 		return nil
 	}
 	if ev.Key() == tcell.KeyCtrlC {
@@ -267,7 +290,7 @@ func (u *UI) formAddAccount() {
 		limit, _ := strconv.ParseFloat(form.GetFormItemByLabel("Limit (GiB)").(*tview.InputField).GetText(), 64)
 		anchor, _ := strconv.Atoi(form.GetFormItemByLabel("Billing day (1-28)").(*tview.InputField).GetText())
 		u.closeForm()
-		if err := u.ctrl.AddAccount(name, tier, limit, anchor); err != nil {
+		if _, err := u.ctrl.AddAccount(name, tier, limit, anchor); err != nil {
 			u.errf("add account: %v", err)
 			return
 		}
@@ -342,6 +365,82 @@ func (u *UI) doDeletePort() {
 		}
 		u.render()
 	})
+}
+
+func (u *UI) formMovePort() {
+	ref, ok := u.selected()
+	if !ok || ref.kind != rowPort {
+		u.errf("select a port row first")
+		return
+	}
+	portID := ref.portID
+	port := ref.port
+
+	// Offer every account as a destination.
+	views, _ := u.ctrl.View()
+	var labels []string
+	var ids []int64
+	cur := 0
+	for _, av := range views {
+		if av.Account.ID == ref.accountID {
+			cur = len(ids)
+		}
+		labels = append(labels, fmt.Sprintf("%s (%s)", av.Account.Name, av.Account.Tier.Describe()))
+		ids = append(ids, av.Account.ID)
+	}
+	if len(ids) < 2 {
+		u.errf("need at least two accounts to move a port")
+		return
+	}
+	form := tview.NewForm()
+	form.AddTextView("Port", strconv.Itoa(int(port)), 30, 1, true, false)
+	form.AddDropDown("Destination", labels, cur, nil)
+	form.AddButton("Move", func() {
+		idx, _ := form.GetFormItemByLabel("Destination").(*tview.DropDown).GetCurrentOption()
+		u.closeForm()
+		if idx < 0 || idx >= len(ids) {
+			u.errf("invalid destination")
+			return
+		}
+		if err := u.ctrl.MovePort(portID, ids[idx]); err != nil {
+			u.errf("move port: %v", err)
+			return
+		}
+		u.render()
+	})
+	form.AddButton("Cancel", u.closeForm)
+	u.showForm(form, "Move port", 9)
+}
+
+func (u *UI) formSetUsage() {
+	ref, ok := u.selected()
+	if !ok || ref.kind != rowAccount {
+		u.errf("select an account row first")
+		return
+	}
+	acct := ref.account
+	if !acct.Tier.HasQuota() {
+		u.errf("account %q is unlimited; no usage to set", acct.Name)
+		return
+	}
+	form := tview.NewForm()
+	form.AddInputField("Used (GiB)", "0", 12, tview.InputFieldFloat, nil)
+	form.AddButton("Apply", func() {
+		gib, err := strconv.ParseFloat(form.GetFormItemByLabel("Used (GiB)").(*tview.InputField).GetText(), 64)
+		u.closeForm()
+		if err != nil || gib < 0 {
+			u.errf("invalid usage value")
+			return
+		}
+		bytes := uint64(gib * float64(1<<30))
+		if err := u.ctrl.SetUsage(acct.ID, bytes); err != nil {
+			u.errf("set usage: %v", err)
+			return
+		}
+		u.render()
+	})
+	form.AddButton("Cancel", u.closeForm)
+	u.showForm(form, "Set usage: "+acct.Name, 9)
 }
 
 func (u *UI) formChangeTier() {

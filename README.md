@@ -9,6 +9,37 @@ The metering fast path and the breaker are entirely in the kernel; user space
 only samples, persists, resets and reconciles — so if the Go process dies, the
 breaker still holds.
 
+## Server / client roles
+
+The same binary runs in one of two roles:
+
+- **`nfuse --rpc`** — the **server daemon**. It runs the engine and listens on a
+  Unix domain socket. It is the **only** process that touches nftables and
+  SQLite (sampling, persistence, monthly resets, and every mutation go through
+  its single reconcile path), so there is no write contention. This is the role
+  systemd keeps running.
+- **`nfuse`** (default) — the **client / TUI**. It only connects to the socket,
+  renders the UI, and sends each user action as an RPC. It touches neither the
+  kernel nor the DB. If the daemon is not reachable it exits with an error
+  telling you to start the service — there is **no embedded-engine fallback**.
+
+The transport is newline-delimited JSON over the socket. Mutating RPCs return
+only `ok`/`err`; after a success the client re-reads full state via `GetState`.
+All mutations are serialized behind the engine's reconcile lock, shared with the
+sampling and reset loops, so the ruleset is never half-updated.
+
+### Cold start vs hot restart
+
+On startup the daemon probes whether its nftables table already exists to decide
+the authoritative source of usage:
+
+- **table absent = cold start** (the machine rebooted, kernel state is empty) →
+  **SQLite is authoritative**: build the table seeding counters/quotas from the DB.
+- **table present = hot restart** (the process was relaunched, e.g. by
+  `Restart=on-failure`, but the box stayed up) → **the kernel is authoritative**:
+  sample the live values, fold them into SQLite, and rebuild seeding from those,
+  so a stale DB never overwrites usage the kernel is still tracking.
+
 ## How it works
 
 ### Metering (kernel, netdev @ NIC)
@@ -92,13 +123,14 @@ mutation and sampling runs at human timescales.
 ## Layout
 
 ```
-main.go                 flags, kernel preflight, wiring, signals
+main.go                 flags, role split (server daemon vs TUI client), signals
 internal/model          domain types + invariants (account→port→counter tree)
 internal/store          SQLite (WAL) load/save + reboot backfill
 internal/nft            nftables manager: script generation + JSON sampling
 internal/engine         sampling loop, non-blocking persistence, resets, reconcile
+internal/rpc            Unix-socket JSON RPC: server (engine) + client (TUI)
 internal/system         kernel-version preflight (netdev egress ≥ 5.16)
-internal/tui            tview UI
+internal/tui            tview UI (drives a local engine or the RPC client)
 ```
 
 ## Usage
@@ -106,19 +138,23 @@ internal/tui            tview UI
 ```sh
 go build -o nfuse .
 
-sudo ./nfuse --iface ens5 --db /var/lib/nfuse/nfuse.db   # control plane + TUI
-sudo ./nfuse --headless                                  # no TUI (daemon)
+# Server daemon (owns nft + SQLite, no TUI) — the systemd-managed role:
+sudo ./nfuse --rpc --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfuse.sock
+
+# Client TUI (connects to the daemon's socket; errors out if it can't):
+sudo ./nfuse --socket /run/nfuse.sock
+
 sudo ./nfuse --teardown                                  # remove the ruleset
 ```
 
-Requires root (nftables) and Linux ≥ 5.16. Flags: `--iface`, `--table`, `--db`,
-`--sample-interval`, `--persist-interval`, `--ui-refresh`, `--headless`,
-`--teardown`, `--skip-kernel-check`.
+The daemon requires root (nftables) and Linux ≥ 5.16. Flags: `--rpc`,
+`--socket`, `--iface`, `--table`, `--db`, `--sample-interval`,
+`--persist-interval`, `--ui-refresh`, `--teardown`, `--skip-kernel-check`.
 
 ### TUI keys
 
 `a` add account · `d` delete account · `p` add port · `x` delete port ·
-`t` change tier · `r` reset quota · `q` quit
+`m` move port · `t` change tier · `r` reset quota · `u` set usage · `q` quit
 
 ## Testing
 

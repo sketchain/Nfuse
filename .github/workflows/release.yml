@@ -66,25 +66,23 @@ jobs:
           # Nfuse drives nftables netdev hooks and reads /proc, so it is a
           # Linux-only tool; we ship every mainstream Linux architecture.
           # The pure-Go SQLite driver lets us cross-compile with CGO disabled.
+          #
+          # We publish the bare binary for each target (no tar.gz / archive), so
+          # a release asset is directly runnable after download + chmod +x.
           LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}"
           build() {
             local goarch="$1" goarm="${2:-}"
             local name="nfuse_${VERSION}_linux_${goarch}"
             [ -n "$goarm" ] && name="${name}v${goarm}"
             echo "==> $name"
-            local dir="dist/$name"
-            mkdir -p "$dir"
             env CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" \
-              go build -trimpath -ldflags "$LDFLAGS" -o "$dir/nfuse" .
-            cp README.md LICENSE "$dir/"
-            tar -czf "dist/${name}.tar.gz" -C dist "$name"
-            rm -rf "$dir"
+              go build -trimpath -ldflags "$LDFLAGS" -o "dist/$name" .
           }
           build amd64
           build arm64
           build arm 7
           build 386
-          ( cd dist && sha256sum *.tar.gz > SHA256SUMS.txt )
+          ( cd dist && sha256sum nfuse_* > SHA256SUMS.txt )
           echo "Artifacts:"; ls -la dist
 
       - name: Publish release
@@ -98,19 +96,20 @@ jobs:
           {
             echo "Automated release built from \`main\` @ \`${COMMIT}\`."
             echo
-            echo "Linux binaries (pure Go, statically linked, CGO disabled):"
+            echo "Linux binaries (pure Go, statically linked, CGO disabled)."
+            echo "Assets are bare executables — download, \`chmod +x\`, and run."
             echo
-            echo "| Archive | Arch |"
-            echo "|---------|------|"
-            echo "| nfuse_${VERSION}_linux_amd64.tar.gz | x86-64 |"
-            echo "| nfuse_${VERSION}_linux_arm64.tar.gz | ARM64 (aarch64) |"
-            echo "| nfuse_${VERSION}_linux_armv7.tar.gz | ARMv7 (32-bit) |"
-            echo "| nfuse_${VERSION}_linux_386.tar.gz | x86 (32-bit) |"
+            echo "| Binary | Arch |"
+            echo "|--------|------|"
+            echo "| nfuse_${VERSION}_linux_amd64 | x86-64 |"
+            echo "| nfuse_${VERSION}_linux_arm64 | ARM64 (aarch64) |"
+            echo "| nfuse_${VERSION}_linux_armv7 | ARMv7 (32-bit) |"
+            echo "| nfuse_${VERSION}_linux_386 | x86 (32-bit) |"
             echo
             echo "Verify with \`sha256sum -c SHA256SUMS.txt\`."
             echo "Requires Linux >= 5.16 (nftables netdev egress hook) and root."
           } > "$NOTES"
-          gh release create "$VERSION" dist/*.tar.gz dist/SHA256SUMS.txt \
+          gh release create "$VERSION" dist/nfuse_* dist/SHA256SUMS.txt \
             --title "$VERSION" \
             --notes-file "$NOTES" \
             --target "$GITHUB_SHA"

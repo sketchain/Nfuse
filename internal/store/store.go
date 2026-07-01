@@ -190,6 +190,21 @@ func (s *Store) DeletePort(id int64) error {
 	return err
 }
 
+// MovePort reassigns a port to a different account. Counters are keyed by port
+// id, so they follow the port unchanged.
+func (s *Store) MovePort(portID, newAccountID int64) error {
+	_, err := s.db.Exec(`UPDATE ports SET account_id = ? WHERE id = ?`, newAccountID, portID)
+	return err
+}
+
+// SetUsage overwrites an account's persisted quota "used" value to an arbitrary
+// target (used by the SetUsage RPC to raise or lower recorded consumption). The
+// kernel quota is re-seeded to the same value by the subsequent reconcile.
+func (s *Store) SetUsage(id int64, usedBytes uint64) error {
+	_, err := s.db.Exec(`UPDATE accounts SET used_bytes = ? WHERE id = ?`, usedBytes, id)
+	return err
+}
+
 // PersistUsage writes a batch of live kernel readings back to SQLite. It is the
 // periodic "落盘" side path: account quota usage plus every counter snapshot,
 // applied in a single transaction. Called off the sampling goroutine.

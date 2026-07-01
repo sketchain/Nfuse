@@ -1,12 +1,16 @@
 // Command nfuse meters per-port bidirectional traffic on a NIC using nftables
-// netdev hooks, persists usage to SQLite, enforces per-account quotas with an
-// in-kernel circuit breaker, and offers a TUI for management.
+// netdev hooks, persists usage to SQLite, and enforces per-account quotas with
+// an in-kernel circuit breaker. It runs in one of two roles from the same
+// binary:
 //
-// Usage:
-//
-//	nfuse [flags]              run the control plane + TUI
-//	nfuse --teardown           remove the kernel ruleset and exit
-//	nfuse --headless           run the control plane without the TUI
+//	nfuse --rpc                run the server daemon: engine + RPC socket, no TUI.
+//	                           This is the ONLY process that touches nft/SQLite;
+//	                           systemd keeps it running.
+//	nfuse                      run the client: connect to the daemon's socket and
+//	                           render the TUI. Touches neither the kernel nor the
+//	                           DB — every action is an RPC. If the daemon is not
+//	                           running it errors out (no embedded-engine fallback).
+//	nfuse --teardown           remove the kernel ruleset and exit.
 package main
 
 import (
@@ -21,6 +25,7 @@ import (
 
 	"github.com/sketchain/nfuse/internal/engine"
 	"github.com/sketchain/nfuse/internal/nft"
+	"github.com/sketchain/nfuse/internal/rpc"
 	"github.com/sketchain/nfuse/internal/store"
 	"github.com/sketchain/nfuse/internal/system"
 	"github.com/sketchain/nfuse/internal/tui"
@@ -36,13 +41,14 @@ var (
 
 func main() {
 	var (
+		rpcMode     = flag.Bool("rpc", false, "run as the server daemon (engine + RPC socket, no TUI)")
+		socket      = flag.String("socket", "/run/nfuse.sock", "unix socket path for client/server RPC")
 		iface       = flag.String("iface", "ens5", "network interface to meter")
 		table       = flag.String("table", "nfuse", "nftables table name")
 		dbPath      = flag.String("db", "/var/lib/nfuse/nfuse.db", "SQLite database path")
 		sampleIvl   = flag.Duration("sample-interval", 2*time.Second, "kernel counter sampling interval")
 		persistIvl  = flag.Duration("persist-interval", 15*time.Second, "SQLite persistence interval")
 		refreshIvl  = flag.Duration("ui-refresh", time.Second, "TUI refresh interval")
-		headless    = flag.Bool("headless", false, "run without the TUI (control plane only)")
 		teardown    = flag.Bool("teardown", false, "remove the nftables ruleset and exit")
 		skipKernChk = flag.Bool("skip-kernel-check", false, "skip the netdev egress kernel version check")
 		showVer     = flag.Bool("version", false, "print version information and exit")
@@ -56,15 +62,9 @@ func main() {
 
 	logger := log.New(os.Stderr, "nfuse: ", log.LstdFlags)
 
-	if !*skipKernChk {
-		if err := system.CheckNetdevEgress(); err != nil {
-			logger.Fatalf("preflight: %v", err)
-		}
-	}
-
-	mgr := nft.New(*table, *iface)
-
 	if *teardown {
+		// Teardown touches the kernel directly and is a server-side operation.
+		mgr := nft.New(*table, *iface)
 		if err := mgr.Teardown(); err != nil {
 			logger.Fatalf("teardown: %v", err)
 		}
@@ -72,44 +72,98 @@ func main() {
 		return
 	}
 
-	if err := ensureDBDir(*dbPath); err != nil {
+	if *rpcMode {
+		runServer(logger, serverOpts{
+			socket: *socket, iface: *iface, table: *table, dbPath: *dbPath,
+			sampleIvl: *sampleIvl, persistIvl: *persistIvl, skipKernChk: *skipKernChk,
+		})
+		return
+	}
+
+	runClient(logger, *socket, *refreshIvl)
+}
+
+type serverOpts struct {
+	socket, iface, table, dbPath string
+	sampleIvl, persistIvl        time.Duration
+	skipKernChk                  bool
+}
+
+// runServer is the daemon role: it owns nft and SQLite, runs the engine, and
+// serves RPCs. It is what systemd keeps running.
+func runServer(logger *log.Logger, o serverOpts) {
+	kernelOK := true
+	var kernelRaw string
+	if _, _, raw, err := system.KernelVersion(); err == nil {
+		kernelRaw = raw
+	}
+	if !o.skipKernChk {
+		if err := system.CheckNetdevEgress(); err != nil {
+			logger.Fatalf("preflight: %v", err)
+		}
+	} else {
+		// We skipped enforcement, so we can't assert the kernel is adequate.
+		kernelOK = false
+	}
+
+	mgr := nft.New(o.table, o.iface)
+
+	if err := ensureDBDir(o.dbPath); err != nil {
 		logger.Fatalf("db dir: %v", err)
 	}
-	st, err := store.Open(*dbPath)
+	st, err := store.Open(o.dbPath)
 	if err != nil {
 		logger.Fatalf("open db: %v", err)
 	}
 	defer st.Close()
 
 	ctrl, err := engine.New(st, mgr, engine.Options{
-		SampleInterval:  *sampleIvl,
-		PersistInterval: *persistIvl,
+		SampleInterval:  o.sampleIvl,
+		PersistInterval: o.persistIvl,
 		Logf:            logger.Printf,
 	})
 	if err != nil {
 		logger.Fatalf("engine: %v", err)
 	}
 	ctrl.Start()
+	defer ctrl.Stop()
 
-	if *headless {
-		runHeadless(ctrl, logger)
-		return
+	srv := rpc.NewServer(ctrl, o.iface, kernelOK, kernelRaw, logger.Printf)
+	if err := srv.Listen(o.socket); err != nil {
+		logger.Fatalf("rpc listen: %v", err)
 	}
+	defer srv.Close()
 
-	ui := tui.New(ctrl, *refreshIvl)
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve() }()
+	logger.Printf("nfuse daemon listening on %s (iface %s); press Ctrl-C to stop", o.socket, o.iface)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-sig:
+		logger.Printf("shutting down")
+	case err := <-errCh:
+		if err != nil {
+			logger.Printf("rpc serve: %v", err)
+		}
+	}
+}
+
+// runClient is the TUI role: it connects to the daemon and renders the UI.
+// Without a reachable daemon it exits with an error — the client never runs an
+// embedded engine.
+func runClient(logger *log.Logger, socket string, refresh time.Duration) {
+	client, err := rpc.Dial(socket)
+	if err != nil {
+		logger.Fatalf("cannot connect to nfuse daemon at %s: %v\nStart the service first: nfuse --rpc", socket, err)
+	}
+	defer client.Close()
+
+	ui := tui.New(client, refresh)
 	if err := ui.Run(); err != nil {
 		logger.Printf("tui: %v", err)
 	}
-	ctrl.Stop()
-}
-
-func runHeadless(ctrl *engine.Controller, logger *log.Logger) {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	logger.Printf("running headless; press Ctrl-C to stop")
-	<-sig
-	logger.Printf("shutting down")
-	ctrl.Stop()
 }
 
 func ensureDBDir(path string) error {

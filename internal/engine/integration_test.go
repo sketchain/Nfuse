@@ -54,7 +54,7 @@ func TestIntegration(t *testing.T) {
 	defer ctrl.Stop()
 
 	// Tier a account with two ports.
-	if err := ctrl.AddAccount("alice", model.TierMonthly, 1, 15); err != nil {
+	if _, err := ctrl.AddAccount("alice", model.TierMonthly, 1, 15); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
 	views, _ := ctrl.View()
@@ -160,7 +160,7 @@ func TestPersistenceBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
-	if err := ctrl.AddAccount("bob", model.TierOneShot, 1, 1); err != nil {
+	if _, err := ctrl.AddAccount("bob", model.TierOneShot, 1, 1); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
 	views, _ := ctrl.View()
