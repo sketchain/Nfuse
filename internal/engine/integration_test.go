@@ -14,12 +14,27 @@ import (
 	"github.com/sketchain/nfuse/internal/store"
 )
 
-// TestIntegration exercises the full stack against real nftables on the loopback
-// interface. It requires root + nft and is skipped otherwise.
-func TestIntegration(t *testing.T) {
+// requireNftAdmin skips the test unless nft is present AND the process can
+// actually mutate the ruleset. On CI runners the nft binary exists but the job
+// lacks CAP_NET_ADMIN, so a real probe (not just LookPath) is needed.
+func requireNftAdmin(t *testing.T) {
+	t.Helper()
 	if _, err := exec.LookPath("nft"); err != nil {
 		t.Skip("nft not available")
 	}
+	const probe = "nfuse_probe"
+	// Adding then removing a throwaway table exercises the same privileged
+	// netlink path our code uses; "Operation not permitted" here means no caps.
+	if out, err := exec.Command("nft", "add", "table", "netdev", probe).CombinedOutput(); err != nil {
+		t.Skipf("nftables not permitted in this environment: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	_ = exec.Command("nft", "delete", "table", "netdev", probe).Run()
+}
+
+// TestIntegration exercises the full stack against real nftables on the loopback
+// interface. It requires root + nft and is skipped otherwise.
+func TestIntegration(t *testing.T) {
+	requireNftAdmin(t)
 	table := "nfuse_it"
 	mgr := nft.New(table, "lo")
 	defer mgr.Teardown()
@@ -132,9 +147,7 @@ func TestIntegration(t *testing.T) {
 // TestPersistenceBackfill verifies that usage is reloaded and seeded across a
 // simulated restart.
 func TestPersistenceBackfill(t *testing.T) {
-	if _, err := exec.LookPath("nft"); err != nil {
-		t.Skip("nft not available")
-	}
+	requireNftAdmin(t)
 	table := "nfuse_bf"
 	dbPath := filepath.Join(t.TempDir(), "bf.db")
 
