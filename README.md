@@ -187,6 +187,10 @@ The daemon requires root (nftables) and Linux ≥ 5.16. Flags: `--rpc`,
 `a` add account · `d` delete account · `p` add port · `x` delete port ·
 `m` move port · `t` change tier · `r` reset quota · `u` set usage · `q` quit
 
+Deleting an account that still owns ports removes the account **and all of its
+ports** in one atomic step; the confirmation prompt names the port count first.
+A portless account is deleted directly.
+
 The status bar shows the sampling clock (or the last error in red) plus a daemon
 line from `GetHealth`: managed **iface**, **uptime**, and **last persist** time
 (`never` until the first snapshot).

@@ -364,12 +364,17 @@ func (c *Controller) AddAccount(name string, tier model.Tier, limitGiB float64, 
 	return newID, err
 }
 
-// DeleteAccount removes an account; it must own no ports.
-func (c *Controller) DeleteAccount(id int64) error {
+// DeleteAccount removes an account. When cascade is false it refuses an account
+// that still owns ports (the caller must remove them first); when cascade is
+// true it deletes the account together with all of its ports (and their
+// counters) atomically inside a single reconcile — the store's DELETE relies on
+// the schema's ON DELETE CASCADE, so the whole subtree is removed in one step,
+// never as a sequence of separate RPCs.
+func (c *Controller) DeleteAccount(id int64, cascade bool) error {
 	c.mu.Lock()
 	ports := c.snap.PortsFor(id)
 	c.mu.Unlock()
-	if len(ports) > 0 {
+	if len(ports) > 0 && !cascade {
 		return fmt.Errorf("account still owns %d port(s); remove them first", len(ports))
 	}
 	return c.reconcile(func() error { return c.store.DeleteAccount(id) })

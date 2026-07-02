@@ -31,7 +31,7 @@ type healthProvider interface {
 type Controller interface {
 	View() ([]engine.AccountView, string)
 	AddAccount(name string, tier model.Tier, limitGiB float64, anchorDay int) (int64, error)
-	DeleteAccount(id int64) error
+	DeleteAccount(id int64, cascade bool) error
 	SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay int) error
 	AddPort(accountID int64, port uint16) error
 	DeletePort(portID int64) error
@@ -52,6 +52,16 @@ type UI struct {
 	// rowRef maps a table row index to the object it represents so key actions
 	// know their target.
 	rowRef map[int]rowRef
+
+	// The selection is remembered by *entity identity* rather than by raw row
+	// index: render() rebuilds the table from scratch each tick, so rows shift as
+	// accounts/ports are added, removed or reordered. After every rebuild the
+	// selection is restored to the same object (see restoreSelection), so a
+	// refresh tick — or a mutation elsewhere — never silently repoints it.
+	haveSel      bool
+	selKind      rowKind
+	selAccountID int64
+	selPortID    int64
 }
 
 type rowKind int
@@ -106,6 +116,20 @@ func (u *UI) buildLayout() {
 	u.pages.AddPage("main", main, true, true)
 	u.app.SetRoot(u.pages, true).EnableMouse(true)
 	u.table.SetInputCapture(u.onKey)
+	// Track the selected entity by identity whenever the row selection changes
+	// (via keyboard navigation or a click on the table), so it survives rebuilds.
+	u.table.SetSelectionChangedFunc(u.onSelectionChanged)
+}
+
+// onSelectionChanged records the entity behind the newly selected row so the
+// selection can be restored by identity after the next render() rebuild.
+func (u *UI) onSelectionChanged(row, _ int) {
+	if ref, ok := u.rowRef[row]; ok {
+		u.haveSel = true
+		u.selKind = ref.kind
+		u.selAccountID = ref.accountID
+		u.selPortID = ref.portID
+	}
 }
 
 // Run starts the UI event loop and refresh ticker; it blocks until the user
@@ -175,6 +199,7 @@ func (u *UI) render() {
 	if row == 1 {
 		u.table.SetCell(1, 0, tview.NewTableCell("(no accounts — press 'a' to add one)").SetSelectable(false))
 	}
+	u.restoreSelection()
 
 	statusLine := fmt.Sprintf("[green]sampling[-]  %s", time.Now().Format("15:04:05"))
 	if lastErr != "" {
@@ -231,6 +256,71 @@ func (u *UI) selected() (rowRef, bool) {
 	return ref, ok
 }
 
+// restoreSelection re-points the table selection at the remembered entity after
+// render() has rebuilt rowRef. If that entity is gone (e.g. deleted), it falls
+// back to the entity's parent account when a port vanished, else to the first
+// selectable row. Called at the end of every render.
+func (u *UI) restoreSelection() {
+	if len(u.rowRef) == 0 {
+		return // no selectable rows (no accounts yet)
+	}
+	if u.haveSel {
+		switch u.selKind {
+		case rowPort:
+			if row, ok := u.rowForPort(u.selPortID); ok {
+				u.table.Select(row, 0)
+				return
+			}
+			// The port was removed; fall back to its parent account if it remains.
+			if row, ok := u.rowForAccount(u.selAccountID); ok {
+				u.table.Select(row, 0)
+				return
+			}
+		case rowAccount:
+			if row, ok := u.rowForAccount(u.selAccountID); ok {
+				u.table.Select(row, 0)
+				return
+			}
+		}
+	}
+	// No remembered selection, or the entity (and its parent) are gone: settle on
+	// the first selectable row.
+	u.table.Select(u.firstSelectableRow(), 0)
+}
+
+func (u *UI) rowForPort(id int64) (int, bool) {
+	for row, ref := range u.rowRef {
+		if ref.kind == rowPort && ref.portID == id {
+			return row, true
+		}
+	}
+	return 0, false
+}
+
+func (u *UI) rowForAccount(id int64) (int, bool) {
+	for row, ref := range u.rowRef {
+		if ref.kind == rowAccount && ref.accountID == id {
+			return row, true
+		}
+	}
+	return 0, false
+}
+
+// firstSelectableRow returns the lowest row index that maps to an entity (rowRef
+// never holds the header row), defaulting to 1 when the map is unexpectedly bare.
+func (u *UI) firstSelectableRow() int {
+	best := -1
+	for row := range u.rowRef {
+		if best == -1 || row < best {
+			best = row
+		}
+	}
+	if best == -1 {
+		return 1
+	}
+	return best
+}
+
 func (u *UI) onKey(ev *tcell.EventKey) *tcell.EventKey {
 	switch ev.Rune() {
 	case 'q':
@@ -278,9 +368,37 @@ func (u *UI) errf(format string, args ...any) {
 	u.flash("[red]" + fmt.Sprintf(format, args...))
 }
 
+// modalHost wraps a full-screen page primitive (a tview.Modal or a centered
+// form Flex) so that any mouse event the wrapped primitive does not itself
+// consume is swallowed here instead of falling through to the table on the page
+// beneath. tview.Modal and the centering Flex only consume clicks that land on
+// their own widgets (buttons, inputs); a click on the surrounding blank area —
+// or a stray MouseLeftUp/Click that the Modal leaves unconsumed — would
+// otherwise reach the table and silently move its selection, or dismiss nothing
+// while looking like "the click did nothing". Consuming everything the inner
+// primitive declines makes the overlay truly modal to the mouse while leaving
+// its own buttons/inputs fully clickable.
+type modalHost struct {
+	tview.Primitive
+}
+
+func (h modalHost) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
+	inner := h.Primitive.MouseHandler()
+	return func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(tview.Primitive)) (bool, tview.Primitive) {
+		if inner != nil {
+			if consumed, capture := inner(action, event, setFocus); consumed {
+				return consumed, capture
+			}
+		}
+		// Backstop: consume every remaining mouse event so nothing reaches the
+		// primitives on the page(s) beneath this overlay.
+		return true, nil
+	}
+}
+
 func (u *UI) modal(text string, buttons []string, done func(int, string)) {
 	m := tview.NewModal().SetText(text).AddButtons(buttons).SetDoneFunc(done)
-	u.pages.AddPage("modal", m, true, true)
+	u.pages.AddPage("modal", modalHost{m}, true, true)
 	u.app.SetFocus(m)
 }
 
@@ -304,7 +422,7 @@ func (u *UI) showForm(form *tview.Form, title string, height int) {
 			AddItem(form, 60, 0, true).
 			AddItem(nil, 0, 1, false), height, 0, true).
 		AddItem(nil, 0, 1, false)
-	u.pages.AddPage("form", wrap, true, true)
+	u.pages.AddPage("form", modalHost{wrap}, true, true)
 	u.app.SetFocus(form)
 }
 
@@ -350,12 +468,27 @@ func (u *UI) doDeleteAccount() {
 		u.errf("select an account row first")
 		return
 	}
-	u.modal(fmt.Sprintf("Delete account %q?", ref.account.Name), []string{"Delete", "Cancel"}, func(i int, _ string) {
+	// Count the account's ports so the prompt is honest and the delete cascades
+	// only when there is actually something to cascade to.
+	var portCount int
+	views, _ := u.ctrl.View()
+	for _, av := range views {
+		if av.Account.ID == ref.accountID {
+			portCount = len(av.Ports)
+			break
+		}
+	}
+	cascade := portCount > 0
+	prompt := fmt.Sprintf("Delete account %q?", ref.account.Name)
+	if cascade {
+		prompt = fmt.Sprintf("Delete account %q and its %d port(s)?", ref.account.Name, portCount)
+	}
+	u.modal(prompt, []string{"Delete", "Cancel"}, func(i int, _ string) {
 		u.closeModal()
 		if i != 0 {
 			return
 		}
-		if err := u.ctrl.DeleteAccount(ref.accountID); err != nil {
+		if err := u.ctrl.DeleteAccount(ref.accountID, cascade); err != nil {
 			u.errf("delete account: %v", err)
 			return
 		}
