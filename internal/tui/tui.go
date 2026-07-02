@@ -13,7 +13,15 @@ import (
 
 	"github.com/sketchain/nfuse/internal/engine"
 	"github.com/sketchain/nfuse/internal/model"
+	"github.com/sketchain/nfuse/internal/rpc"
 )
+
+// healthProvider is optionally implemented by a Controller (the RPC client) to
+// expose daemon health metadata for the status bar. The in-process engine does
+// not implement it, so the extra status line simply doesn't appear in that role.
+type healthProvider interface {
+	Health() (rpc.HealthResult, error)
+}
 
 // Controller is the set of operations the UI drives. It is satisfied both by the
 // in-process engine (server role) and by the RPC client (client role), so the
@@ -172,7 +180,43 @@ func (u *UI) render() {
 	if lastErr != "" {
 		statusLine = "[red]" + lastErr + "[-]"
 	}
+	if line := u.healthLine(); line != "" {
+		statusLine += "\n" + line
+	}
 	u.status.SetText(statusLine)
+}
+
+// healthLine renders a daemon-info line (iface, uptime, last persist) when the
+// controller exposes health, or "" otherwise.
+func (u *UI) healthLine() string {
+	hp, ok := u.ctrl.(healthProvider)
+	if !ok {
+		return ""
+	}
+	h, err := hp.Health()
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("[white]daemon[-] iface %s · up %s · last persist %s",
+		h.Iface, formatUptime(h.UptimeSeconds), formatPersist(h.LastPersistUnix))
+}
+
+// formatUptime renders a seconds count as a compact h/m/s duration.
+func formatUptime(seconds float64) string {
+	d := (time.Duration(seconds) * time.Second).Round(time.Second)
+	if d < time.Minute {
+		return d.String()
+	}
+	return d.Truncate(time.Second).String()
+}
+
+// formatPersist renders a last-persist unix timestamp as wall-clock time, or
+// "never" when nothing has been persisted yet.
+func formatPersist(unix int64) string {
+	if unix == 0 {
+		return "never"
+	}
+	return time.Unix(unix, 0).Format("15:04:05")
 }
 
 func (u *UI) setRow(row int, cells []string, color tcell.Color) {

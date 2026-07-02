@@ -168,9 +168,13 @@ func TestPersistenceBackfill(t *testing.T) {
 	if err := ctrl.AddPort(aid, 7070); err != nil {
 		t.Fatalf("add port: %v", err)
 	}
-	// Simulate accumulated usage by writing directly to the DB, then "restart".
-	if err := st.PersistUsage(map[int64]uint64{aid: 500 * 1024 * 1024}, nil); err != nil {
-		t.Fatalf("persist: %v", err)
+	// Simulate accumulated usage by setting it through the engine (SetUsage seeds
+	// both the kernel quota and SQLite via the normal reconcile path), then
+	// "restart". Writing straight to the DB behind the engine's back would be
+	// undone by the final persist, which correctly folds the live kernel state
+	// (used=0) back over it — see reconcile's fresh-sample fold.
+	if err := ctrl.SetUsage(aid, 500*1024*1024); err != nil {
+		t.Fatalf("set usage: %v", err)
 	}
 	ctrl.Stop()
 	mgr.Teardown()

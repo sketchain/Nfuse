@@ -3,14 +3,26 @@ package rpc
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sketchain/nfuse/internal/engine"
 	"github.com/sketchain/nfuse/internal/model"
 )
+
+// reconnectBackoff is the pause before a single reconnect attempt when a call
+// hits a connection-level error (the daemon was restarted under us).
+const reconnectBackoff = 500 * time.Millisecond
+
+// errServerClosed marks a round-trip that failed because the server hung up
+// mid-request; it is treated as a connection-level error worth reconnecting on.
+var errServerClosed = errors.New("server closed connection")
 
 // Client is the TUI-side handle to a running Nfuse daemon. Its method set
 // matches what the TUI needs (the tui.Controller interface), so the same UI code
@@ -18,9 +30,12 @@ import (
 //
 // A single connection carries all traffic; a mutex serializes request/response
 // round-trips so the refresh goroutine and key handlers cannot interleave on the
-// wire.
+// wire. If the daemon is restarted (e.g. by systemd), a call that hits a
+// connection-level error transparently redials the socket once and replays the
+// request, so an open TUI recovers instead of dying red-screened.
 type Client struct {
 	mu   sync.Mutex
+	path string
 	conn net.Conn
 	enc  *json.Encoder
 	sc   *bufio.Scanner
@@ -30,23 +45,65 @@ type Client struct {
 // client: the caller should surface it and exit (there is no embedded-engine
 // fallback — only the daemon may touch nft/SQLite).
 func Dial(path string) (*Client, error) {
-	conn, err := net.DialTimeout("unix", path, 3*time.Second)
-	if err != nil {
+	c := &Client{path: path}
+	if err := c.connect(); err != nil {
 		return nil, err
+	}
+	return c, nil
+}
+
+// connect dials the socket and installs a fresh encoder/scanner. Callers hold
+// c.mu (or, for Dial, own the not-yet-shared Client).
+func (c *Client) connect() error {
+	conn, err := net.DialTimeout("unix", c.path, 3*time.Second)
+	if err != nil {
+		return err
 	}
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	return &Client{conn: conn, enc: json.NewEncoder(conn), sc: sc}, nil
+	c.conn = conn
+	c.enc = json.NewEncoder(conn)
+	c.sc = sc
+	return nil
 }
 
 // Close closes the underlying connection.
-func (c *Client) Close() error { return c.conn.Close() }
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
+}
 
-// call sends one request and decodes the response. Params may be nil.
+// call sends one request and decodes the response, retrying once over a fresh
+// connection if the first attempt fails at the connection level. Params may be
+// nil.
 func (c *Client) call(method string, params any, result any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	err := c.roundTrip(method, params, result)
+	if err == nil || !isConnErr(err) {
+		return err
+	}
+	// The daemon likely restarted under us: pause briefly, redial once and
+	// replay this request. If reconnecting fails, surface the original error so
+	// the TUI shows red and the next refresh tick tries again.
+	time.Sleep(reconnectBackoff)
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	if rerr := c.connect(); rerr != nil {
+		return err
+	}
+	return c.roundTrip(method, params, result)
+}
+
+// roundTrip performs a single request/response exchange on the current
+// connection. Connection-level failures are wrapped so isConnErr can spot them.
+func (c *Client) roundTrip(method string, params any, result any) error {
 	var raw json.RawMessage
 	if params != nil {
 		b, err := json.Marshal(params)
@@ -62,7 +119,7 @@ func (c *Client) call(method string, params any, result any) error {
 		if err := c.sc.Err(); err != nil {
 			return fmt.Errorf("read %s reply: %w", method, err)
 		}
-		return fmt.Errorf("%s: server closed connection", method)
+		return fmt.Errorf("%s: %w", method, errServerClosed)
 	}
 	var resp Response
 	if err := json.Unmarshal(c.sc.Bytes(), &resp); err != nil {
@@ -77,6 +134,25 @@ func (c *Client) call(method string, params any, result any) error {
 		}
 	}
 	return nil
+}
+
+// isConnErr reports whether err is a connection-level failure worth reconnecting
+// on (as opposed to an application-level error the daemon returned).
+func isConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errServerClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "use of closed network connection")
 }
 
 // View fetches the full state via GetState. On error it returns an empty view

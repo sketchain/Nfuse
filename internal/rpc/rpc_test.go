@@ -164,6 +164,74 @@ func TestClientServerRoundTrip(t *testing.T) {
 	}
 }
 
+// TestListenRefusesLiveDaemon covers P1-5: a second daemon must not steal a
+// socket a live daemon already owns, and the first daemon must keep working.
+func TestListenRefusesLiveDaemon(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "nfuse.sock")
+	be := newFakeBackend()
+
+	s1 := NewServer(be, "eth0", true, "6.18.5", nil)
+	if err := s1.Listen(sock); err != nil {
+		t.Fatalf("first Listen: %v", err)
+	}
+	go s1.Serve()
+	defer s1.Close()
+
+	// A second instance on the same live socket must be refused.
+	s2 := NewServer(be, "eth0", true, "6.18.5", nil)
+	if err := s2.Listen(sock); err == nil {
+		s2.Close()
+		t.Fatal("second Listen succeeded, want refusal while a daemon is live")
+	}
+
+	// The first daemon's socket must remain intact and usable.
+	cli, err := Dial(sock)
+	if err != nil {
+		t.Fatalf("dial first daemon after refused takeover: %v", err)
+	}
+	defer cli.Close()
+	if _, err := cli.Health(); err != nil {
+		t.Fatalf("first daemon broken after refused takeover: %v", err)
+	}
+}
+
+// TestClientReconnects covers P1-4: an open client transparently recovers when
+// the daemon is restarted under it (systemd Restart=on-failure).
+func TestClientReconnects(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "nfuse.sock")
+	be := newFakeBackend()
+
+	s1 := NewServer(be, "eth0", true, "6.18.5", nil)
+	if err := s1.Listen(sock); err != nil {
+		t.Fatalf("listen s1: %v", err)
+	}
+	go s1.Serve()
+
+	cli, err := Dial(sock)
+	if err != nil {
+		s1.Close()
+		t.Fatalf("dial: %v", err)
+	}
+	defer cli.Close()
+	if _, err := cli.Health(); err != nil {
+		t.Fatalf("initial Health: %v", err)
+	}
+
+	// Restart the daemon on the same socket.
+	s1.Close()
+	s2 := NewServer(be, "eth0", true, "6.18.5", nil)
+	if err := s2.Listen(sock); err != nil {
+		t.Fatalf("relisten s2: %v", err)
+	}
+	go s2.Serve()
+	defer s2.Close()
+
+	// The next call must reconnect and succeed without the caller re-dialing.
+	if _, err := cli.Health(); err != nil {
+		t.Fatalf("client did not reconnect after daemon restart: %v", err)
+	}
+}
+
 func TestServerReportsError(t *testing.T) {
 	be := &errBackend{}
 	cli, cleanup := startTestServer(t, be)

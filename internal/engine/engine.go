@@ -33,13 +33,21 @@ type Controller struct {
 	sampleInterval  time.Duration
 	persistInterval time.Duration
 
-	mu          sync.Mutex // guards snap, live, lastPersist
+	mu          sync.Mutex // guards snap, live, lastPersist, gen
 	snap        model.Snapshot
 	live        nft.Sample // latest kernel reading
 	logf        func(string, ...any)
 	lastErr     string
 	startedAt   time.Time // process start (for health uptime)
 	lastPersist time.Time // last successful SQLite snapshot
+
+	// gen is a monotonic generation counter, bumped whenever a mutation changes
+	// the kernel's expected quota/counter values (reconcile, ResetAccount,
+	// SetUsage). The sampling loop records it before issuing a (slow, lock-free)
+	// Sample() and re-checks it before writing the result back: if it advanced in
+	// the meantime, a mutation lowered usage while the sample was in flight, so
+	// the sample is stale and discarded to avoid silently reviving old usage.
+	gen uint64
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -159,13 +167,22 @@ func (c *Controller) sampleLoop() {
 		case <-c.stopCh:
 			return
 		case <-t.C:
+			// Record the generation before the (slow, lock-free) sample so we can
+			// tell if a usage-lowering mutation completed while we were reading.
+			c.mu.Lock()
+			startGen := c.gen
+			c.mu.Unlock()
 			s, err := c.nft.Sample()
 			if err != nil {
 				c.setErr(fmt.Sprintf("sample: %v", err))
 				continue
 			}
 			c.mu.Lock()
-			c.live = s
+			// Drop the sample if a mutation changed expected kernel state while it
+			// was in flight; the next tick will re-sample the reconciled values.
+			if c.gen == startGen {
+				c.live = s
+			}
 			c.lastErr = ""
 			c.mu.Unlock()
 		}
@@ -222,6 +239,12 @@ func (c *Controller) persistNow() error {
 	c.mu.Unlock()
 
 	if len(used) == 0 && len(counters) == 0 {
+		// Nothing to write (e.g. no accounts yet), but this still counts as a
+		// successful persist tick: record it so health reflects a live persister
+		// instead of "never persisted", and skip the empty DB transaction.
+		c.mu.Lock()
+		c.lastPersist = time.Now()
+		c.mu.Unlock()
 		return nil
 	}
 	if err := c.store.PersistUsage(used, counters); err != nil {
@@ -258,6 +281,26 @@ func (c *Controller) reconcile(mutate func() error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Take a *fresh* sample before folding. The periodic sampleLoop value can be
+	// up to a sample-interval old, so the traffic metered between the last sample
+	// and this rebuild would be lost from both counters and quota on every
+	// mutation. Sampling here (like adoptLiveState does on hot restart) captures
+	// it. If the table is present but sampling fails we refuse the mutation
+	// rather than rebuild from stale accounting and silently drop that traffic;
+	// if the table is absent (e.g. before the first account exists) there is
+	// nothing to sample, so we continue.
+	exists, err := c.nft.TableExists()
+	if err != nil {
+		return fmt.Errorf("probe table before reconcile: %w", err)
+	}
+	if exists {
+		s, err := c.nft.Sample()
+		if err != nil {
+			return fmt.Errorf("fresh sample before reconcile: %w", err)
+		}
+		c.live = s
+	}
+
 	// Fold the freshest live values into DB so the rebuild reseeds from them.
 	used := make(map[int64]uint64, len(c.live.AccountUsed))
 	for id, v := range c.live.AccountUsed {
@@ -288,6 +331,9 @@ func (c *Controller) reconcile(mutate func() error) error {
 		return fmt.Errorf("apply: %w", err)
 	}
 	c.snap = snap
+	// This rebuild reseeded the kernel's quota/counter values, so any sample the
+	// sampleLoop took before now is stale: bump the generation to discard it.
+	c.gen++
 	return nil
 }
 
@@ -305,7 +351,7 @@ func (c *Controller) AddAccount(name string, tier model.Tier, limitGiB float64, 
 		return 0, fmt.Errorf("tier %s requires a positive limit", tier)
 	}
 	if anchorDay < 1 || anchorDay > 28 {
-		anchorDay = 1
+		return 0, fmt.Errorf("billing anchor day must be between 1 and 28, got %d", anchorDay)
 	}
 	var newID int64
 	err = c.reconcile(func() error {
@@ -338,8 +384,11 @@ func (c *Controller) SetTier(id int64, tier model.Tier, limitGiB float64, anchor
 		return fmt.Errorf("tier %s requires a positive limit", tier)
 	}
 	if anchorDay < 1 || anchorDay > 28 {
-		anchorDay = 1
+		return fmt.Errorf("billing anchor day must be between 1 and 28, got %d", anchorDay)
 	}
+	// Note: switching tiers deliberately does NOT clear used_bytes. Moving an
+	// account a/b → c only *pauses* metering; moving back revives the historical
+	// usage and re-seeds it into the kernel quota. Use ResetAccount to zero it.
 	return c.reconcile(func() error { return c.store.SetTier(id, tier, limitGiB, anchorDay) })
 }
 
@@ -453,6 +502,9 @@ func (c *Controller) ResetAccount(id int64) error {
 	if c.live.AccountUsed != nil {
 		c.live.AccountUsed[id] = 0
 	}
+	// The kernel quota was just zeroed; discard any sample still in flight so it
+	// cannot write the pre-reset usage back over this reset.
+	c.gen++
 	c.mu.Unlock()
 	return nil
 }

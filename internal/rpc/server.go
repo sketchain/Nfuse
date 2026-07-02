@@ -61,11 +61,31 @@ func NewServer(be Backend, iface string, kernelOK bool, kernelVersion string, lo
 	return &Server{be: be, iface: iface, kernelOK: kernelOK, kernelVersion: kernelVersion, logf: logf, conns: map[net.Conn]struct{}{}}
 }
 
-// Listen binds the Unix socket at path, removing any stale socket file first.
+// DaemonAlive reports whether a live daemon is already listening on the socket
+// at path. It dials with a short timeout: a successful connect means another
+// instance owns the socket; a refused/timed-out connect means the file is a dead
+// leftover (or absent). Used both to guard Listen against double-daemon startup
+// and to guard --teardown against clobbering a running daemon's ruleset.
+func DaemonAlive(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// Listen binds the Unix socket at path. If a live daemon already answers on it,
+// Listen refuses (returning an error) rather than removing the socket and
+// stealing it — two engines rebuilding the same nft table would corrupt each
+// other's state. A socket file with no live daemon behind it is a stale leftover
+// from an unclean shutdown and is removed before binding.
 func (s *Server) Listen(path string) error {
-	// A leftover socket from an unclean shutdown would make Listen fail with
-	// "address already in use"; remove it (only if it is actually a socket).
 	if fi, err := os.Stat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		if DaemonAlive(path) {
+			return fmt.Errorf("another nfuse daemon is already listening on %s; stop it first", path)
+		}
+		// Dead socket from an unclean shutdown; safe to reclaim.
 		_ = os.Remove(path)
 	}
 	ln, err := net.Listen("unix", path)

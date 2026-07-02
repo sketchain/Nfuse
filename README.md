@@ -28,6 +28,17 @@ only `ok`/`err`; after a success the client re-reads full state via `GetState`.
 All mutations are serialized behind the engine's reconcile lock, shared with the
 sampling and reset loops, so the ruleset is never half-updated.
 
+**Single instance.** On startup the daemon probes the socket: if a live daemon
+already answers, it **refuses to start** rather than deleting the socket and
+stealing it (two engines rebuilding the same nft table would corrupt each
+other). Only a stale socket left by an unclean shutdown is reclaimed.
+
+**Client reconnect.** If the daemon is restarted under an open TUI (e.g. systemd
+`Restart=on-failure`), a call that hits a connection-level error redials the
+socket once and replays the request, so the client recovers instead of dying;
+if the daemon is still down the status bar shows the error and the next refresh
+retries.
+
 ### Cold start vs hot restart
 
 On startup the daemon probes whether its nftables table already exists to decide
@@ -84,7 +95,15 @@ the post-drop counter freezes below the limit.
 | `c`  | unlimited            | none         | n/a                   |
 
 Tiers **a** and **b** are byte-for-byte identical in the kernel ("drop once over
-X"). The *only* difference is whether user space performs a periodic reset.
+X"). The *only* difference is whether user space performs a periodic reset. The
+billing anchor day must be **1–28** (values outside that range are rejected, not
+clamped, so a mistyped day never silently changes the cycle).
+
+**Switching tiers does not clear usage — by design.** Moving an account from a/b
+to **c** only *pauses* metering (the quota object is removed); moving it back
+revives the historical `used_bytes` and re-seeds it into the kernel quota. This
+is intentional, not a bug: tier c is "billing paused", not "start over". To
+actually zero usage, reset the account (`r`).
 
 ### Persistence & reboot backfill (SQLite, WAL)
 
@@ -101,11 +120,19 @@ Writes run on their own goroutine/ticker reading the latest in-memory sample, so
 ### Object lifecycle
 
 Every mutation (add/delete account or port, tier change) is applied by **full
-atomic reconciliation**: sample live values → fold them into SQLite → rebuild the
-whole table from a single `nft -f` script (`add table; delete table; add table`).
-This creates/reclaims counters, quotas and rules correctly without hand-tracking
-rule handles, and can't leave the ruleset half-updated. Live values are folded in
-first, so a rebuild loses no accounting.
+atomic reconciliation**: take a **fresh** live sample → fold it into SQLite →
+rebuild the whole table from a single `nft -f` script (`add table; delete table;
+add table`). This creates/reclaims counters, quotas and rules correctly without
+hand-tracking rule handles, and can't leave the ruleset half-updated. The sample
+is taken *at reconcile time* (not reused from the periodic sampler), so the
+traffic metered between the last periodic sample and the rebuild is not lost; if
+the live table can't be sampled the mutation is refused rather than rebuilt from
+stale accounting.
+
+A monotonic generation counter guards against a slow periodic sample racing a
+usage-lowering mutation (reset, monthly reset, set-usage): a sample taken before
+such a mutation completes is discarded instead of writing the pre-change value
+back over it.
 
 ## Why `nft` instead of a netlink library
 
@@ -147,6 +174,10 @@ sudo ./nfuse --socket /run/nfuse.sock
 sudo ./nfuse --teardown                                  # remove the ruleset
 ```
 
+`--teardown` refuses to run while a daemon is live on the socket (it would fight
+the running engine, which rebuilds the table on its next mutation). Stop the
+service first (`systemctl stop nfuse`, or kill the `--rpc` process).
+
 The daemon requires root (nftables) and Linux ≥ 5.16. Flags: `--rpc`,
 `--socket`, `--iface`, `--table`, `--db`, `--sample-interval`,
 `--persist-interval`, `--ui-refresh`, `--teardown`, `--skip-kernel-check`.
@@ -155,6 +186,10 @@ The daemon requires root (nftables) and Linux ≥ 5.16. Flags: `--rpc`,
 
 `a` add account · `d` delete account · `p` add port · `x` delete port ·
 `m` move port · `t` change tier · `r` reset quota · `u` set usage · `q` quit
+
+The status bar shows the sampling clock (or the last error in red) plus a daemon
+line from `GetHealth`: managed **iface**, **uptime**, and **last persist** time
+(`never` until the first snapshot).
 
 ## Testing
 

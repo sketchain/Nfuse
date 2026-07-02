@@ -217,16 +217,32 @@ func (m *execManager) TableExists() (bool, error) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		// A non-zero exit means nft ran but the table is absent ("No such file
-		// or directory"). Any other failure (binary missing, timeout) is a real
-		// error the caller must see rather than misread as a cold start.
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return false, nil
-		}
-		return false, fmt.Errorf("nft list table: %v: %s", err, strings.TrimSpace(stderr.String()))
+		return classifyTableExists(err, stderr.String())
 	}
 	return true, nil
+}
+
+// classifyTableExists interprets a failed `nft list table` invocation. Only a
+// non-zero exit whose stderr explicitly says the table is absent counts as a
+// cold start ((false, nil)). Every other failure — permission denied, a
+// transient netlink error, a missing binary, a timeout — is returned as an
+// error so the daemon refuses to start instead of misreading it as a cold start
+// and rolling the quota back to a stale SQLite seed (which could let a breached
+// account slip back under budget).
+func classifyTableExists(runErr error, stderr string) (bool, error) {
+	var ee *exec.ExitError
+	if errors.As(runErr, &ee) && tableAbsentErr(stderr) {
+		return false, nil
+	}
+	return false, fmt.Errorf("nft list table: %v: %s", runErr, strings.TrimSpace(stderr))
+}
+
+// tableAbsentErr reports whether nft's stderr unambiguously indicates the table
+// does not exist (as opposed to some other non-zero-exit failure).
+func tableAbsentErr(stderr string) bool {
+	s := strings.ToLower(stderr)
+	return strings.Contains(s, "no such file or directory") ||
+		strings.Contains(s, "does not exist")
 }
 
 func (m *execManager) Teardown() error {

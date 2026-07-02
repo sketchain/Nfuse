@@ -21,6 +21,12 @@ import (
 // Kernel-side, TierMonthly and TierOneShot are identical ("drop once over
 // LimitBytes"); the only difference is whether user space performs a periodic
 // reset. TierUnlimited installs no quota object at all.
+//
+// Switching tiers is intentionally non-destructive to UsedBytes: moving an
+// account from a/b to c only *pauses* billing (the quota object goes away), and
+// moving it back revives the historical usage and re-seeds it into the kernel
+// quota. This is deliberate — it is not a bug to "fix". To actually zero usage,
+// reset the account explicitly (see ResetAccount).
 type Tier string
 
 const (
@@ -81,7 +87,8 @@ type Account struct {
 	Tier     Tier
 	LimitGiB float64 // quota limit in GiB; ignored for TierUnlimited
 	// BillingAnchorDay is the day-of-month (1-28) on which a TierMonthly
-	// account's cycle rolls over. Clamped to 28 to avoid month-length gaps.
+	// account's cycle rolls over. Restricted to 1-28 to avoid month-length gaps;
+	// out-of-range values are rejected at the mutation layer, not clamped.
 	BillingAnchorDay int
 	UsedBytes        uint64 // persisted quota "used" snapshot
 	LastResetUnix    int64  // unix seconds of last monthly reset

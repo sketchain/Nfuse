@@ -1,6 +1,7 @@
 package nft
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -62,6 +63,39 @@ func TestBuildScript(t *testing.T) {
 	cntIdx := strings.Index(script, `th dport 8080 counter name "p10_in"`)
 	if dropIdx < 0 || cntIdx < 0 || dropIdx > cntIdx {
 		t.Errorf("breaker rule must precede counter rule (drop=%d counter=%d)", dropIdx, cntIdx)
+	}
+}
+
+// TestClassifyTableExists covers the three branches of TableExists's error
+// handling (P0-3): a genuine "table absent" cold start, some other non-zero exit
+// (e.g. permission denied) which must surface as an error, and a non-exit
+// failure (binary missing) which must also surface — never misread as cold.
+func TestClassifyTableExists(t *testing.T) {
+	// A real *exec.ExitError from a command that exits non-zero.
+	exitErr := exec.Command("false").Run()
+	if exitErr == nil {
+		t.Fatal("expected `false` to exit non-zero")
+	}
+
+	// Table absent: non-zero exit whose stderr says so -> cold start.
+	for _, stderr := range []string{
+		"Error: No such file or directory",
+		"Error: table 'nfuse' does not exist",
+	} {
+		exists, err := classifyTableExists(exitErr, stderr)
+		if exists || err != nil {
+			t.Errorf("classifyTableExists(_, %q) = (%v, %v), want (false, nil)", stderr, exists, err)
+		}
+	}
+
+	// Other non-zero exit (e.g. no CAP_NET_ADMIN) -> must be an error.
+	if _, err := classifyTableExists(exitErr, "Error: Operation not permitted"); err == nil {
+		t.Error("permission-denied exit must return an error, not a cold start")
+	}
+
+	// Non-exit failure (binary missing / spawn error) -> must be an error.
+	if _, err := classifyTableExists(exec.ErrNotFound, ""); err == nil {
+		t.Error("non-exit failure must return an error, not a cold start")
 	}
 }
 

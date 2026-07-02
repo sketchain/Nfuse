@@ -64,6 +64,13 @@ func main() {
 
 	if *teardown {
 		// Teardown touches the kernel directly and is a server-side operation.
+		// Refuse if a daemon is running: it would immediately start erroring on
+		// sampling and rebuild the table from its in-memory snapshot on the next
+		// mutation, leaving kernel and daemon state at odds.
+		if rpc.DaemonAlive(*socket) {
+			logger.Fatalf("nfuse daemon appears to be running on %s; stop it first "+
+				"(systemctl stop nfuse, or kill the --rpc process) before --teardown", *socket)
+		}
 		mgr := nft.New(*table, *iface)
 		if err := mgr.Teardown(); err != nil {
 			logger.Fatalf("teardown: %v", err)
