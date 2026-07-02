@@ -57,6 +57,10 @@ type AddAccountParams struct {
 
 type DeleteAccountParams struct {
 	ID int64 `json:"id"`
+	// Cascade, when true, deletes the account together with all of its ports.
+	// It is an optional field: an older client that omits it decodes to false,
+	// preserving the original "refuse if the account still owns ports" behavior.
+	Cascade bool `json:"cascade,omitempty"`
 }
 
 type SetTierParams struct {

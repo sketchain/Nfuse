@@ -125,8 +125,8 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("reset tier b: %v", err)
 	}
 
-	// Cannot delete account with ports.
-	if err := ctrl.DeleteAccount(aid); err == nil {
+	// Cannot delete account with ports when cascade is not requested.
+	if err := ctrl.DeleteAccount(aid, false); err == nil {
 		t.Errorf("expected delete-with-ports rejection")
 	}
 	// Delete ports then account.
@@ -135,7 +135,7 @@ func TestIntegration(t *testing.T) {
 			t.Fatalf("delete port %d: %v", p.Port, err)
 		}
 	}
-	if err := ctrl.DeleteAccount(aid); err != nil {
+	if err := ctrl.DeleteAccount(aid, false); err != nil {
 		t.Fatalf("delete account: %v", err)
 	}
 	dump = nftDump(t, table)

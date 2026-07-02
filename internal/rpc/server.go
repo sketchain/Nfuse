@@ -20,7 +20,7 @@ import (
 type Backend interface {
 	View() ([]engine.AccountView, string)
 	AddAccount(name string, tier model.Tier, limitGiB float64, anchorDay int) (int64, error)
-	DeleteAccount(id int64) error
+	DeleteAccount(id int64, cascade bool) error
 	SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay int) error
 	AddPort(accountID int64, port uint16) error
 	DeletePort(portID int64) error
@@ -201,7 +201,7 @@ func (s *Server) dispatch(req Request) Response {
 		if err := unmarshal(req.Params, &p); err != nil {
 			return fail(err)
 		}
-		return okErr(s.be.DeleteAccount(p.ID))
+		return okErr(s.be.DeleteAccount(p.ID, p.Cascade))
 
 	case MethodSetTier:
 		var p SetTierParams

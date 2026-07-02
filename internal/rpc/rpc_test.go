@@ -20,9 +20,17 @@ type fakeBackend struct {
 
 	setUsage    map[int64]uint64
 	moved       map[int64]int64
+	deleted     []deleteCall
 	persisted   int
 	started     time.Time
 	lastPersist time.Time
+}
+
+// deleteCall records one DeleteAccount invocation so tests can assert the
+// cascade flag was forwarded over the wire.
+type deleteCall struct {
+	id      int64
+	cascade bool
 }
 
 func newFakeBackend() *fakeBackend {
@@ -49,7 +57,12 @@ func (f *fakeBackend) AddAccount(name string, tier model.Tier, limitGiB float64,
 	return f.nextID, nil
 }
 
-func (f *fakeBackend) DeleteAccount(id int64) error { return nil }
+func (f *fakeBackend) DeleteAccount(id int64, cascade bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, deleteCall{id: id, cascade: cascade})
+	return nil
+}
 func (f *fakeBackend) SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay int) error {
 	return nil
 }
@@ -133,6 +146,21 @@ func TestClientServerRoundTrip(t *testing.T) {
 	}
 	if got := be.setUsage[1]; got != 12345 {
 		t.Fatalf("backend SetUsage = %d, want 12345", got)
+	}
+
+	// DeleteAccount forwards the cascade flag both ways over the wire.
+	if err := cli.DeleteAccount(1, true); err != nil {
+		t.Fatalf("DeleteAccount cascade: %v", err)
+	}
+	if err := cli.DeleteAccount(2, false); err != nil {
+		t.Fatalf("DeleteAccount no-cascade: %v", err)
+	}
+	be.mu.Lock()
+	gotDeletes := append([]deleteCall(nil), be.deleted...)
+	be.mu.Unlock()
+	want := []deleteCall{{id: 1, cascade: true}, {id: 2, cascade: false}}
+	if len(gotDeletes) != len(want) || gotDeletes[0] != want[0] || gotDeletes[1] != want[1] {
+		t.Fatalf("backend DeleteAccount calls = %+v, want %+v", gotDeletes, want)
 	}
 
 	// MovePort forwards both ids.
@@ -237,7 +265,7 @@ func TestServerReportsError(t *testing.T) {
 	cli, cleanup := startTestServer(t, be)
 	defer cleanup()
 
-	err := cli.DeleteAccount(99)
+	err := cli.DeleteAccount(99, false)
 	if err == nil || err.Error() != "boom" {
 		t.Fatalf("DeleteAccount err = %v, want boom", err)
 	}
@@ -246,7 +274,7 @@ func TestServerReportsError(t *testing.T) {
 // errBackend fails every mutation to check error propagation over the wire.
 type errBackend struct{ fakeBackend }
 
-func (e *errBackend) DeleteAccount(id int64) error { return errBoom }
+func (e *errBackend) DeleteAccount(id int64, cascade bool) error { return errBoom }
 
 var errBoom = boomErr{}
 

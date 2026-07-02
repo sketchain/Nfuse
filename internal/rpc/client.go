@@ -181,8 +181,8 @@ func (c *Client) AddAccount(name string, tier model.Tier, limitGiB float64, anch
 	return res.ID, err
 }
 
-func (c *Client) DeleteAccount(id int64) error {
-	return c.call(MethodDeleteAcct, DeleteAccountParams{ID: id}, nil)
+func (c *Client) DeleteAccount(id int64, cascade bool) error {
+	return c.call(MethodDeleteAcct, DeleteAccountParams{ID: id, Cascade: cascade}, nil)
 }
 
 func (c *Client) SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay int) error {
