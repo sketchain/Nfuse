@@ -68,7 +68,7 @@ jobs:
           # The pure-Go SQLite driver lets us cross-compile with CGO disabled.
           #
           # Each target is packaged as nfuse-<arch>.tar.gz — the arch named the
-          # `uname -m` way, with no version in the filename — holding exactly one
+          # Go (GOARCH) way, with no version in the filename — holding exactly one
           # file: the executable `nfuse` with its execute bit set. No README,
           # LICENSE, directory prefix or anything else goes in the archive.
           LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}"
@@ -85,10 +85,10 @@ jobs:
             tar -czf "dist/nfuse-${arch}.tar.gz" -C "$staging" nfuse
             rm -rf "$staging"
           }
-          build amd64 ""  x86_64
-          build arm64 ""  aarch64
-          build arm   7   armv7l
-          build 386   ""  i686
+          build amd64 ""  amd64
+          build arm64 ""  arm64
+          build arm   7   armv7
+          build 386   ""  386
           ( cd dist && sha256sum nfuse-*.tar.gz > SHA256SUMS.txt )
           echo "Artifacts:"; ls -la dist
 
@@ -108,10 +108,10 @@ jobs:
             echo
             echo "| Asset | Arch |"
             echo "|-------|------|"
-            echo "| nfuse-x86_64.tar.gz | x86-64 |"
-            echo "| nfuse-aarch64.tar.gz | ARM64 (aarch64) |"
-            echo "| nfuse-armv7l.tar.gz | ARMv7 (32-bit) |"
-            echo "| nfuse-i686.tar.gz | x86 (32-bit) |"
+            echo "| nfuse-amd64.tar.gz | x86-64 (amd64) |"
+            echo "| nfuse-arm64.tar.gz | ARM64 (arm64) |"
+            echo "| nfuse-armv7.tar.gz | ARMv7 (32-bit) |"
+            echo "| nfuse-386.tar.gz | x86 (32-bit, 386) |"
             echo
             echo "Verify with \`sha256sum -c SHA256SUMS.txt\`."
             echo "Requires Linux >= 5.16 (nftables netdev egress hook) and root."

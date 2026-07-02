@@ -62,7 +62,20 @@ type UI struct {
 	selKind      rowKind
 	selAccountID int64
 	selPortID    int64
+
+	// Daemon health is fetched at a fraction of the render rate: iface, uptime and
+	// last-persist time don't need per-tick freshness, and each fetch is a
+	// synchronous RPC. healthProv is nil when the controller doesn't expose health
+	// (the in-process engine role), in which case the status line is omitted.
+	healthProv      healthProvider
+	healthCache     rpc.HealthResult
+	healthValid     bool
+	healthCountdown int
 }
+
+// healthRefreshTicks is how many render ticks pass between daemon-health fetches;
+// at the default 1s refresh that's ~5s.
+const healthRefreshTicks = 5
 
 type rowKind int
 
@@ -92,6 +105,9 @@ func New(ctrl Controller, refresh time.Duration) *UI {
 		ctrl:    ctrl,
 		refresh: refresh,
 		rowRef:  map[int]rowRef{},
+	}
+	if hp, ok := ctrl.(healthProvider); ok {
+		u.healthProv = hp
 	}
 	u.buildLayout()
 	return u
@@ -212,16 +228,28 @@ func (u *UI) render() {
 }
 
 // healthLine renders a daemon-info line (iface, uptime, last persist) when the
-// controller exposes health, or "" otherwise.
+// controller exposes health, or "" otherwise. The health RPC is issued only once
+// every healthRefreshTicks renders and the result is cached in between; a failed
+// fetch is retried on the very next tick rather than waiting the full interval.
 func (u *UI) healthLine() string {
-	hp, ok := u.ctrl.(healthProvider)
-	if !ok {
+	if u.healthProv == nil {
 		return ""
 	}
-	h, err := hp.Health()
-	if err != nil {
+	if u.healthCountdown <= 0 {
+		if h, err := u.healthProv.Health(); err == nil {
+			u.healthCache = h
+			u.healthValid = true
+			u.healthCountdown = healthRefreshTicks
+		} else {
+			// Retry next tick; keep any previously cached value on screen.
+			u.healthCountdown = 0
+		}
+	}
+	u.healthCountdown--
+	if !u.healthValid {
 		return ""
 	}
+	h := u.healthCache
 	return fmt.Sprintf("[white]daemon[-] iface %s · up %s · last persist %s",
 		h.Iface, formatUptime(h.UptimeSeconds), formatPersist(h.LastPersistUnix))
 }

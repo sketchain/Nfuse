@@ -55,7 +55,8 @@ the authoritative source of usage:
 
 ### Metering (kernel, netdev @ NIC)
 
-Two device-bound chains are attached to the managed interface (default `ens5`):
+Two device-bound chains are attached to the managed interface (`--iface`, e.g.
+`ens5`):
 
 - **ingress** hook — matches **destination port** `P` (external → local port `P`)
 - **egress** hook — matches **source port** `P` (local port `P` → external)
@@ -178,9 +179,33 @@ sudo ./nfuse --teardown                                  # remove the ruleset
 the running engine, which rebuilds the table on its next mutation). Stop the
 service first (`systemctl stop nfuse`, or kill the `--rpc` process).
 
-The daemon requires root (nftables) and Linux ≥ 5.16. Flags: `--rpc`,
+The daemon requires root (nftables) and Linux ≥ 5.16. `--iface` is **required
+for `--rpc`** (there is no default): the daemon refuses to start if it is empty
+or names an interface that doesn't exist on the host — pick one from
+`ip -br link`. `--teardown` and the TUI client don't need it. Flags: `--rpc`,
 `--socket`, `--iface`, `--table`, `--db`, `--sample-interval`,
 `--persist-interval`, `--ui-refresh`, `--teardown`, `--skip-kernel-check`.
+
+### Running under systemd
+
+```ini
+[Unit]
+Description=Nfuse traffic-metering daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# --iface is required; substitute your NIC (see `ip -br link`).
+ExecStart=/usr/local/bin/nfuse --rpc --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfuse.sock
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+If the NIC isn't up yet the daemon exits non-zero and `Restart=on-failure`
+retries until it appears — the intended behavior rather than metering the wrong
+(or no) interface.
 
 ### TUI keys
 

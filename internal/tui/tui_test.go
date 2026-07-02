@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -11,7 +12,70 @@ import (
 
 	"github.com/sketchain/nfuse/internal/engine"
 	"github.com/sketchain/nfuse/internal/model"
+	"github.com/sketchain/nfuse/internal/rpc"
 )
+
+// healthCtrl is a fakeCtrl that also satisfies healthProvider, counting how often
+// its Health RPC is invoked so the caching cadence can be asserted.
+type healthCtrl struct {
+	*fakeCtrl
+	calls int
+	fail  bool
+}
+
+func (h *healthCtrl) Health() (rpc.HealthResult, error) {
+	h.calls++
+	if h.fail {
+		return rpc.HealthResult{}, fmt.Errorf("daemon down")
+	}
+	return rpc.HealthResult{Iface: "ens5"}, nil
+}
+
+// TestHealthLineCachesAcrossTicks covers task 5: the Health RPC is issued only
+// once every healthRefreshTicks renders (not per tick), and the cached value is
+// used for the line in between.
+func TestHealthLineCachesAcrossTicks(t *testing.T) {
+	hc := &healthCtrl{fakeCtrl: oneAccountTwoPorts()}
+	u := New(hc, time.Hour)
+	if u.healthProv == nil {
+		t.Fatal("healthProvider not wired up in New")
+	}
+
+	// Over 12 ticks with healthRefreshTicks=5, fetches land on ticks 1, 6 and 11.
+	for i := 0; i < 12; i++ {
+		line := u.healthLine()
+		if !strings.Contains(line, "ens5") {
+			t.Fatalf("tick %d: health line missing cached iface: %q", i+1, line)
+		}
+	}
+	if want := 3; hc.calls != want {
+		t.Fatalf("Health called %d times over 12 ticks, want %d (every %d ticks)",
+			hc.calls, want, healthRefreshTicks)
+	}
+}
+
+// TestHealthLineRetriesAfterFailure covers task 5's failure clause: when a fetch
+// fails, the next tick retries immediately instead of waiting the full interval,
+// and no line is shown until a fetch succeeds.
+func TestHealthLineRetriesAfterFailure(t *testing.T) {
+	hc := &healthCtrl{fakeCtrl: oneAccountTwoPorts(), fail: true}
+	u := New(hc, time.Hour)
+
+	for i := 0; i < 3; i++ {
+		if line := u.healthLine(); line != "" {
+			t.Fatalf("tick %d: expected empty line while health unavailable, got %q", i+1, line)
+		}
+	}
+	if hc.calls != 3 {
+		t.Fatalf("failed Health fetch retried %d times over 3 ticks, want 3 (retry every tick)", hc.calls)
+	}
+
+	// Recovery: the very next tick fetches, succeeds and renders from cache.
+	hc.fail = false
+	if line := u.healthLine(); !strings.Contains(line, "ens5") {
+		t.Fatalf("after recovery expected iface in line, got %q", line)
+	}
+}
 
 // fakeCtrl is an in-memory tui.Controller used to drive the real UI over a
 // tcell SimulationScreen. Its state is mutated only from the UI's own event-loop

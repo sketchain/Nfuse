@@ -54,6 +54,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -102,6 +103,20 @@ type execManager struct {
 // given table name and interface.
 func New(table, iface string) Manager {
 	return &execManager{table: table, iface: iface, priority: -500}
+}
+
+// nftCommand builds an `nft` invocation with the process environment plus a
+// pinned C locale. tableAbsentErr classifies the cold-start "table absent" case
+// by matching nft's English stderr (e.g. "No such file or directory"), but that
+// text comes from strerror() and is localized by LANG/LC_* — on a non-English
+// host (e.g. LANG=zh_CN.UTF-8) the match would fail and a cold start would be
+// misread as an unknown error, so the daemon would refuse to start. Forcing
+// LC_ALL=C keeps every nft command's stderr in English. Routing all invocations
+// through this one helper guarantees no call site is missed.
+func nftCommand(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "nft", args...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	return cmd
 }
 
 // Object naming helpers keep kernel identifiers derivable from ids.
@@ -188,7 +203,7 @@ func (m *execManager) Apply(snap model.Snapshot) error {
 func (m *execManager) runScript(script string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	cmd := nftCommand(ctx, "-f", "-")
 	cmd.Stdin = strings.NewReader(script)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -201,7 +216,7 @@ func (m *execManager) runScript(script string) error {
 func (m *execManager) ResetQuota(accountID int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "nft", "reset", "quota", "netdev", m.table, quotaName(accountID))
+	cmd := nftCommand(ctx, "reset", "quota", "netdev", m.table, quotaName(accountID))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -213,7 +228,7 @@ func (m *execManager) ResetQuota(accountID int64) error {
 func (m *execManager) TableExists() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "nft", "list", "table", "netdev", m.table)
+	cmd := nftCommand(ctx, "list", "table", "netdev", m.table)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -249,7 +264,7 @@ func (m *execManager) Teardown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// Ignore "no such table" style errors: teardown is best-effort.
-	cmd := exec.CommandContext(ctx, "nft", "delete", "table", "netdev", m.table)
+	cmd := nftCommand(ctx, "delete", "table", "netdev", m.table)
 	_ = cmd.Run()
 	return nil
 }
@@ -272,7 +287,7 @@ type nftList struct {
 func (m *execManager) Sample() (Sample, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "nft", "-j", "list", "table", "netdev", m.table)
+	cmd := nftCommand(ctx, "-j", "list", "table", "netdev", m.table)
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr

@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -43,7 +44,7 @@ func main() {
 	var (
 		rpcMode     = flag.Bool("rpc", false, "run as the server daemon (engine + RPC socket, no TUI)")
 		socket      = flag.String("socket", "/run/nfuse.sock", "unix socket path for client/server RPC")
-		iface       = flag.String("iface", "ens5", "network interface to meter")
+		iface       = flag.String("iface", "", "network interface to meter (required for --rpc; e.g. ens5)")
 		table       = flag.String("table", "nfuse", "nftables table name")
 		dbPath      = flag.String("db", "/var/lib/nfuse/nfuse.db", "SQLite database path")
 		sampleIvl   = flag.Duration("sample-interval", 2*time.Second, "kernel counter sampling interval")
@@ -80,6 +81,9 @@ func main() {
 	}
 
 	if *rpcMode {
+		if err := validateIface(*iface); err != nil {
+			logger.Fatalf("%v", err)
+		}
 		runServer(logger, serverOpts{
 			socket: *socket, iface: *iface, table: *table, dbPath: *dbPath,
 			sampleIvl: *sampleIvl, persistIvl: *persistIvl, skipKernChk: *skipKernChk,
@@ -96,9 +100,43 @@ type serverOpts struct {
 	skipKernChk                  bool
 }
 
+// validateIface rejects an empty or non-existent interface for the daemon role.
+// The daemon must meter a real NIC: an empty name would silently build no useful
+// rules, and a name that does not exist would fail later inside `nft -f` with an
+// obscure device error. Failing fast here is the expected behavior under systemd
+// Restart=on-failure while the NIC is still coming up.
+func validateIface(iface string) error {
+	if iface == "" {
+		return fmt.Errorf("--rpc requires --iface <interface>; pick one from `ip -br link` (e.g. --iface ens5)")
+	}
+	if _, err := net.InterfaceByName(iface); err != nil {
+		return fmt.Errorf("interface %q not found on this host; pick one from `ip -br link`: %v", iface, err)
+	}
+	return nil
+}
+
+// singleInstanceGuard refuses to start a second daemon on the same socket. It is
+// called at the very top of runServer, before any resource (nft table, SQLite
+// DB, engine) is touched, so a duplicate daemon is rejected before it can mutate
+// the shared kernel/DB state. rpc.Server.Listen performs the same probe again as
+// a backstop once it is about to bind.
+func singleInstanceGuard(socket string) error {
+	if rpc.DaemonAlive(socket) {
+		return fmt.Errorf("another nfuse daemon is already listening on %s; stop it first", socket)
+	}
+	return nil
+}
+
 // runServer is the daemon role: it owns nft and SQLite, runs the engine, and
 // serves RPCs. It is what systemd keeps running.
 func runServer(logger *log.Logger, o serverOpts) {
+	// Single-instance guard first, before touching any shared resource: a second
+	// daemon must be rejected before engine.New rebuilds the kernel table or the
+	// store opens the shared DB.
+	if err := singleInstanceGuard(o.socket); err != nil {
+		logger.Fatalf("%v", err)
+	}
+
 	kernelOK := true
 	var kernelRaw string
 	if _, _, raw, err := system.KernelVersion(); err == nil {

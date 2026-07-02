@@ -1,12 +1,32 @@
 package nft
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/sketchain/nfuse/internal/model"
 )
+
+// TestNftCommandPinsLocale asserts every nft invocation is built with LC_ALL=C so
+// nft's strerror()-derived stderr stays English. tableAbsentErr matches those
+// English strings to classify a cold start; on a localized host (e.g.
+// LANG=zh_CN.UTF-8) an un-pinned locale would break that match.
+func TestNftCommandPinsLocale(t *testing.T) {
+	cmd := nftCommand(context.Background(), "list", "table", "netdev", "nfuse")
+
+	var found bool
+	for _, kv := range cmd.Env {
+		if kv == "LC_ALL=C" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("nftCommand env missing LC_ALL=C: %v", cmd.Env)
+	}
+}
 
 func TestBuildScript(t *testing.T) {
 	m := &execManager{table: "nfuse", iface: "ens5", priority: -500}
