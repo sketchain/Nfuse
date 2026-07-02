@@ -241,6 +241,112 @@ func TestMouseModalSwallowsOutsideClicks(t *testing.T) {
 	}
 }
 
+// TestMouseModalSwallowsInsideBlankClicks covers task 4: a click that lands
+// *inside* the modal rectangle but on blank space (not a button) must be
+// swallowed too — it must not fall through to the table, must not close the
+// modal, and must not trigger the delete. The modal's own button must still work
+// afterwards.
+func TestMouseModalSwallowsInsideBlankClicks(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUI(t, ctrl)
+	defer cleanup()
+
+	waitFor(t, u.app, "initial selection on the account", func() bool {
+		ref, ok := curSel(u)
+		return ok && ref.kind == rowAccount && ref.accountID == 1
+	})
+
+	// Open the delete-account modal.
+	pressRune(screen, 'd')
+	waitFor(t, u.app, "modal open", func() bool { return u.pages.HasPage("modal") })
+
+	// Locate the Delete button; a point one row above it is inside the modal frame
+	// but on blank space between the prompt text and the button row.
+	bx, by, found := findText(screen, "Delete")
+	if !found {
+		t.Fatal("Delete button not found on screen")
+	}
+	if by < 2 {
+		t.Fatalf("Delete button at y=%d is too high to probe the blank row above it", by)
+	}
+	clickAt(screen, bx, by-1)
+	// Let the injected events drain fully before asserting nothing changed.
+	time.Sleep(120 * time.Millisecond)
+
+	if !onLoop(u.app, func() bool { return u.pages.HasPage("modal") }) {
+		t.Fatal("modal closed by a blank click inside the modal")
+	}
+	if ref := onLoop(u.app, func() rowRef {
+		r, _ := u.table.GetSelection()
+		return u.rowRef[r]
+	}); ref.kind != rowAccount || ref.accountID != 1 {
+		t.Fatalf("inside-blank click leaked to the table and moved selection to %+v", ref)
+	}
+	ctrl.mu.Lock()
+	prematurelyDeleted := ctrl.deleteCalled
+	ctrl.mu.Unlock()
+	if prematurelyDeleted {
+		t.Fatal("delete triggered by a blank click inside the modal")
+	}
+
+	// The modal's own Delete button must still fire the cascade delete.
+	clickAt(screen, bx, by)
+	waitFor(t, u.app, "account deleted and modal closed", func() bool {
+		return !u.pages.HasPage("modal") && len(u.rowRef) == 0
+	})
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if !ctrl.deleteCalled || ctrl.deleteID != 1 || !ctrl.deleteCascade {
+		t.Fatalf("button click delete = {called:%v id:%d cascade:%v}, want {true 1 true}",
+			ctrl.deleteCalled, ctrl.deleteID, ctrl.deleteCascade)
+	}
+}
+
+// TestMouseFormSwallowsOutsideClicks covers task 3: while a form page is open,
+// a click on the surrounding spacer/table area must not fall through to the
+// table (which would silently move the selection), and the form must stay open.
+// The form's own button (Cancel) must still work.
+func TestMouseFormSwallowsOutsideClicks(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUI(t, ctrl)
+	defer cleanup()
+
+	waitFor(t, u.app, "initial selection on the account", func() bool {
+		ref, ok := curSel(u)
+		return ok && ref.kind == rowAccount && ref.accountID == 1
+	})
+
+	// Open the add-account form (centered, 60 wide on a 120-col screen: columns
+	// ~30..90), leaving the left spacer over the underlying table rows.
+	pressRune(screen, 'a')
+	waitFor(t, u.app, "form open", func() bool { return u.pages.HasPage("form") })
+
+	// Click far left (over what would be the 9090 port row at screen row 4). It
+	// must be swallowed by the form's modalHost, not select the port beneath.
+	clickAt(screen, 6, 4)
+	time.Sleep(120 * time.Millisecond)
+
+	if !onLoop(u.app, func() bool { return u.pages.HasPage("form") }) {
+		t.Fatal("form closed by an outside spacer click")
+	}
+	if ref := onLoop(u.app, func() rowRef {
+		r, _ := u.table.GetSelection()
+		return u.rowRef[r]
+	}); ref.kind != rowAccount || ref.accountID != 1 {
+		t.Fatalf("outside spacer click leaked to the table and moved selection to %+v", ref)
+	}
+
+	// The form's own Cancel button must still be clickable and close the form.
+	bx, by, found := findText(screen, "Cancel")
+	if !found {
+		t.Fatal("Cancel button not found on the form")
+	}
+	clickAt(screen, bx, by)
+	waitFor(t, u.app, "form closed by its Cancel button", func() bool {
+		return !u.pages.HasPage("form")
+	})
+}
+
 // TestSelectionSurvivesRerenders covers task 3: a port selection must keep
 // pointing at the same port across repeated render() ticks, and fall back to the
 // parent account when that port is deleted.

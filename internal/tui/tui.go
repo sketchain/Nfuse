@@ -105,7 +105,7 @@ func (u *UI) buildLayout() {
 
 	u.status.SetBorder(true).SetTitle(" status ")
 	help := tview.NewTextView().SetDynamicColors(true)
-	help.SetText("[yellow]a[-] add acct  [yellow]d[-] del acct  [yellow]p[-] add port  [yellow]x[-] del port  [yellow]m[-] move port  [yellow]t[-] tier  [yellow]r[-] reset  [yellow]u[-] set usage  [yellow]q[-] quit")
+	help.SetText("[yellow]a[-] add acct  [yellow]d[-] del acct(+ports)  [yellow]p[-] add port  [yellow]x[-] del port  [yellow]m[-] move port  [yellow]t[-] tier  [yellow]r[-] reset  [yellow]u[-] set usage  [yellow]q[-] quit")
 	help.SetBorder(true).SetTitle(" keys ")
 
 	main := tview.NewFlex().SetDirection(tview.FlexRow).

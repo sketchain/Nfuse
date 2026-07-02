@@ -2,6 +2,7 @@ package engine
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/sketchain/nfuse/internal/model"
@@ -110,6 +111,69 @@ func TestDeleteAccountCascade(t *testing.T) {
 	// The engine's own view must be empty too.
 	if views, _ := ctrl.View(); len(views) != 0 {
 		t.Fatalf("view not empty after cascade delete: %+v", views)
+	}
+}
+
+// TestDeleteAccountRaceGuardsAgainstConcurrentAddPort covers task 1: the
+// cascade=false port guard lives inside the reconcile closure, so a concurrent
+// AddPort can never slip a port in *after* the guard passed but *before* the
+// DELETE runs and have it silently swallowed by ON DELETE CASCADE. The two
+// mutations serialize behind reconcile's c.mu, so exactly one of two safe
+// orderings occurs, regardless of goroutine scheduling:
+//
+//   - AddPort wins: the account then owns a port, so the cascade=false delete is
+//     rejected and both the account and the port survive.
+//   - DeleteAccount wins: the (portless) account is removed, so the later
+//     AddPort fails because the account no longer exists.
+//
+// The one outcome that must never happen is "account deleted AND the port was
+// successfully added": that would mean cascade=false dropped a live port.
+func TestDeleteAccountRaceGuardsAgainstConcurrentAddPort(t *testing.T) {
+	for iter := 0; iter < 50; iter++ {
+		ctrl, _, st := newTestEngine(t)
+
+		id, err := ctrl.AddAccount("alice", model.TierMonthly, 1, 15)
+		if err != nil {
+			t.Fatalf("add account: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var addErr, delErr error
+		go func() { defer wg.Done(); addErr = ctrl.AddPort(id, 8080) }()
+		go func() { defer wg.Done(); delErr = ctrl.DeleteAccount(id, false) }()
+		wg.Wait()
+
+		snap, err := st.Load()
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		_, acctPresent := snap.Account(id)
+		portPresent := len(snap.PortsFor(id)) > 0
+
+		// A port may only exist if the account that owns it exists.
+		if portPresent && !acctPresent {
+			t.Fatalf("iter %d: orphan port survived while account was deleted (cascade=false swallowed a live port): ports=%+v", iter, snap.Ports)
+		}
+		// The forbidden window: delete claimed success AND the add claimed success.
+		if delErr == nil && addErr == nil {
+			t.Fatalf("iter %d: both DeleteAccount and AddPort succeeded — a live port was dropped by a cascade=false delete", iter)
+		}
+		// Cross-check the reported errors against the persisted state.
+		switch {
+		case addErr == nil && delErr != nil:
+			// AddPort won: delete must have been rejected and both survive.
+			if !acctPresent || !portPresent {
+				t.Fatalf("iter %d: AddPort ok / delete rejected, but account=%v port=%v", iter, acctPresent, portPresent)
+			}
+		case delErr == nil && addErr != nil:
+			// DeleteAccount won: the portless account is gone and add failed.
+			if acctPresent || portPresent {
+				t.Fatalf("iter %d: delete ok / AddPort failed, but account=%v port=%v", iter, acctPresent, portPresent)
+			}
+		default:
+			t.Fatalf("iter %d: unexpected error combination addErr=%v delErr=%v", iter, addErr, delErr)
+		}
 	}
 }
 

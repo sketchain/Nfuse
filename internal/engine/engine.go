@@ -370,14 +370,21 @@ func (c *Controller) AddAccount(name string, tier model.Tier, limitGiB float64, 
 // counters) atomically inside a single reconcile — the store's DELETE relies on
 // the schema's ON DELETE CASCADE, so the whole subtree is removed in one step,
 // never as a sequence of separate RPCs.
+//
+// The port guard runs *inside* the reconcile closure, where c.snap is the
+// serialized post-fold truth. Checking it out here (before reconcile) would
+// leave a window in which a concurrent AddPort could slip a port in after the
+// check but before the DELETE, and cascade=false would then silently drop that
+// fresh port via ON DELETE CASCADE. Reconcile holds c.mu for the whole
+// sample→fold→mutate→apply sequence, and a mutate error short-circuits before
+// Apply/gen++, so a rejected delete has no side effects.
 func (c *Controller) DeleteAccount(id int64, cascade bool) error {
-	c.mu.Lock()
-	ports := c.snap.PortsFor(id)
-	c.mu.Unlock()
-	if len(ports) > 0 && !cascade {
-		return fmt.Errorf("account still owns %d port(s); remove them first", len(ports))
-	}
-	return c.reconcile(func() error { return c.store.DeleteAccount(id) })
+	return c.reconcile(func() error {
+		if ports := c.snap.PortsFor(id); len(ports) > 0 && !cascade {
+			return fmt.Errorf("account still owns %d port(s); remove them first", len(ports))
+		}
+		return c.store.DeleteAccount(id)
+	})
 }
 
 // SetTier switches an account's tier, adjusting its quota object accordingly.
