@@ -101,10 +101,10 @@ func TestRealStackCascadeSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
-	if err := cli.AddPort(id, 8080); err != nil {
+	if err := cli.AddPort(id, 8080, 8080); err != nil {
 		t.Fatalf("AddPort 8080: %v", err)
 	}
-	if err := cli.AddPort(id, 9090); err != nil {
+	if err := cli.AddPort(id, 9090, 9090); err != nil {
 		t.Fatalf("AddPort 9090: %v", err)
 	}
 	if got := portsForAccount(t, cli, id); len(got) != 2 {
@@ -137,5 +137,85 @@ func TestRealStackCascadeSemantics(t *testing.T) {
 		if a.Account.ID == id {
 			t.Fatalf("account survived cascade delete over RPC: %+v", a)
 		}
+	}
+}
+
+// portID returns the id of the port whose interval starts at start for the given
+// account, as reported by the client's GetState.
+func portID(t *testing.T, cli *Client, acct int64, start uint16) int64 {
+	t.Helper()
+	for _, p := range portsForAccount(t, cli, acct) {
+		if p.Start == start {
+			return p.PortID
+		}
+	}
+	t.Fatalf("no port starting at %d for account %d", start, acct)
+	return 0
+}
+
+// TestRealStackEditPort covers task 3 over the whole RPC stack (real engine +
+// server + client): a port range can be added and edited, the exclude-self
+// overlap check permits sliding a range onto its own old extent, and edits that
+// collide with another port — same account or cross-account — are rejected.
+func TestRealStackEditPort(t *testing.T) {
+	cli, _ := startRealStackServer(t)
+
+	a1, err := cli.AddAccount("a1", model.TierMonthly, 10, 15)
+	if err != nil {
+		t.Fatalf("AddAccount a1: %v", err)
+	}
+	// Add a range and a second range on the same account.
+	if err := cli.AddPort(a1, 60000, 60099); err != nil {
+		t.Fatalf("AddPort range: %v", err)
+	}
+	if err := cli.AddPort(a1, 60200, 60299); err != nil {
+		t.Fatalf("AddPort range B: %v", err)
+	}
+	pa := portID(t, cli, a1, 60000)
+	pb := portID(t, cli, a1, 60200)
+
+	// Slide A onto its own old extent: legal (self excluded from the check).
+	if err := cli.EditPort(pa, 60001, 60100); err != nil {
+		t.Fatalf("self-overlapping edit must succeed: %v", err)
+	}
+	// GetState reflects the new interval.
+	found := false
+	for _, p := range portsForAccount(t, cli, a1) {
+		if p.PortID == pa {
+			found = true
+			if p.Start != 60001 || p.End != 60100 {
+				t.Fatalf("edited port = %d-%d, want 60001-60100", p.Start, p.End)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("edited port %d not reported by GetState", pa)
+	}
+
+	// Editing A to overlap B (same account) is rejected.
+	if err := cli.EditPort(pa, 60250, 60350); err == nil {
+		t.Fatal("editing A to overlap B must be rejected over RPC")
+	}
+
+	// Cross-account overlap is rejected too.
+	a2, err := cli.AddAccount("a2", model.TierUnlimited, 0, 1)
+	if err != nil {
+		t.Fatalf("AddAccount a2: %v", err)
+	}
+	if err := cli.AddPort(a2, 7000, 7000); err != nil {
+		t.Fatalf("AddPort a2 single: %v", err)
+	}
+	p2 := portID(t, cli, a2, 7000)
+	if err := cli.EditPort(p2, 60200, 60299); err == nil {
+		t.Fatal("editing a2's port to overlap a1's range B must be rejected")
+	}
+	// B is untouched by the rejected edits.
+	if got := portID(t, cli, a1, 60200); got != pb {
+		t.Fatalf("port B changed unexpectedly after rejected edits")
+	}
+
+	// Editing a non-existent port fails.
+	if err := cli.EditPort(999999, 1, 2); err == nil {
+		t.Fatal("editing a non-existent port must fail over RPC")
 	}
 }

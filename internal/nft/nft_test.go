@@ -36,8 +36,9 @@ func TestBuildScript(t *testing.T) {
 			{ID: 2, Name: "unlimited-acct", Tier: model.TierUnlimited},
 		},
 		Ports: []model.Port{
-			{ID: 10, AccountID: 1, Port: 8080},
-			{ID: 11, AccountID: 2, Port: 9090},
+			{ID: 10, AccountID: 1, Start: 8080, End: 8080},
+			{ID: 11, AccountID: 2, Start: 9090, End: 9090},
+			{ID: 12, AccountID: 1, Start: 60000, End: 60099},
 		},
 		Counters: map[model.CounterKey]model.Counter{
 			{PortID: 10, Dir: model.DirIn}: {PortID: 10, Dir: model.DirIn, Packets: 3, Bytes: 300},
@@ -59,6 +60,10 @@ func TestBuildScript(t *testing.T) {
 		`add rule netdev nfuse ingress meta l4proto { tcp, udp } th dport 8080 quota name "acct1" drop`,
 		`add rule netdev nfuse egress meta l4proto { tcp, udp } th sport 8080 quota name "acct1" drop`,
 		`add rule netdev nfuse ingress meta l4proto { tcp, udp } th dport 8080 counter name "p10_in"`,
+		// a port range renders as native nft range matches (one rule per direction,
+		// sharing the account quota) with a single counter pair for the whole span
+		`add rule netdev nfuse ingress meta l4proto { tcp, udp } th dport 60000-60099 quota name "acct1" drop`,
+		`add rule netdev nfuse egress meta l4proto { tcp, udp } th sport 60000-60099 counter name "p12_out"`,
 	}
 	for _, w := range mustContain {
 		if !strings.Contains(script, w) {

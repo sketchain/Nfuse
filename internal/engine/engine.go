@@ -412,26 +412,70 @@ func (c *Controller) SetTier(id int64, tier model.Tier, limitGiB float64, anchor
 	return c.reconcile(func() error { return c.store.SetTier(id, tier, limitGiB, anchorDay) })
 }
 
-// AddPort attaches a port to an account, creating its in/out counters and rules.
-func (c *Controller) AddPort(accountID int64, port uint16) error {
-	if port == 0 {
-		return fmt.Errorf("port must be non-zero")
+// AddPort attaches a port (or a contiguous range) to an account, creating its
+// in/out counters and rules. An end of 0 is shorthand for a single port
+// (end = start), preserving the pre-range call convention.
+//
+// The account-exists and interval-overlap checks run *inside* the reconcile
+// closure, against c.snap (the serialized post-fold truth), following the
+// DeleteAccount precedent: reconcile holds c.mu for the whole
+// sample→fold→mutate→apply sequence, so two concurrent AddPorts can never both
+// pass an overlap check and then both insert overlapping ranges — the loser sees
+// the winner's row in c.snap and is rejected before any side effect.
+func (c *Controller) AddPort(accountID int64, start, end uint16) error {
+	if end == 0 {
+		end = start
 	}
-	c.mu.Lock()
-	_, ok := c.snap.Account(accountID)
-	for _, p := range c.snap.Ports {
-		if p.Port == port {
-			c.mu.Unlock()
-			return fmt.Errorf("port %d already managed by account %d", port, p.AccountID)
-		}
-	}
-	c.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("account %d not found", accountID)
+	np := model.Port{AccountID: accountID, Start: start, End: end}
+	if !np.ValidRange() {
+		return fmt.Errorf("invalid port range %s (need 1 ≤ start ≤ end)", np)
 	}
 	return c.reconcile(func() error {
-		_, err := c.store.CreatePort(model.Port{AccountID: accountID, Port: port})
+		if _, ok := c.snap.Account(accountID); !ok {
+			return fmt.Errorf("account %d not found", accountID)
+		}
+		for _, p := range c.snap.Ports {
+			if p.Overlaps(np) {
+				return fmt.Errorf("port range %s overlaps existing %s (account %d)", np, p, p.AccountID)
+			}
+		}
+		_, err := c.store.CreatePort(np)
 		return err
+	})
+}
+
+// EditPort rewrites an existing port's interval (renumber a single port, shift a
+// range's bounds, or convert between single and range). The port keeps its id, so
+// its counters — named by port id — survive the reconcile rebuild with their
+// accumulated values intact (metering continuity across an edit).
+//
+// The overlap check excludes the port being edited: sliding a range so its new
+// extent overlaps its own old extent (e.g. 60000-60099 → 60001-60100) is a legal
+// move, not a conflict. Like AddPort, the check runs inside the reconcile closure
+// against c.snap so it is atomic against concurrent mutations.
+func (c *Controller) EditPort(portID int64, start, end uint16) error {
+	if end == 0 {
+		end = start
+	}
+	np := model.Port{ID: portID, Start: start, End: end}
+	if !np.ValidRange() {
+		return fmt.Errorf("invalid port range %s (need 1 ≤ start ≤ end)", np)
+	}
+	return c.reconcile(func() error {
+		var found bool
+		for _, p := range c.snap.Ports {
+			if p.ID == portID {
+				found = true
+				continue
+			}
+			if p.Overlaps(np) {
+				return fmt.Errorf("port range %s overlaps existing %s (account %d)", np, p, p.AccountID)
+			}
+		}
+		if !found {
+			return fmt.Errorf("port %d not found", portID)
+		}
+		return c.store.EditPort(portID, start, end)
 	})
 }
 
@@ -568,10 +612,12 @@ func nextReset(last time.Time, anchorDay int) time.Time {
 
 // ── Views for the TUI ────────────────────────────────────────────────────────
 
-// PortView is a per-port line combining desired state with live counters.
+// PortView is a per-port line combining desired state with live counters. Start
+// and End describe the port's closed interval (Start == End for a single port).
 type PortView struct {
 	PortID   int64
-	Port     uint16
+	Start    uint16
+	End      uint16
 	InBytes  uint64
 	OutBytes uint64
 }
@@ -596,7 +642,7 @@ func (c *Controller) View() ([]AccountView, string) {
 		for _, p := range c.snap.PortsFor(a.ID) {
 			in := c.live.Counters[model.CounterKey{PortID: p.ID, Dir: model.DirIn}].Bytes
 			out := c.live.Counters[model.CounterKey{PortID: p.ID, Dir: model.DirOut}].Bytes
-			av.Ports = append(av.Ports, PortView{PortID: p.ID, Port: p.Port, InBytes: in, OutBytes: out})
+			av.Ports = append(av.Ports, PortView{PortID: p.ID, Start: p.Start, End: p.End, InBytes: in, OutBytes: out})
 			sum += in + out
 		}
 		if a.Tier.HasQuota() {

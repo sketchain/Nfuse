@@ -24,6 +24,7 @@ const (
 	MethodDeleteAcct   = "DeleteAccount"
 	MethodSetTier      = "SetTier"
 	MethodAddPort      = "AddPort"
+	MethodEditPort     = "EditPort"
 	MethodDeletePort   = "DeletePort"
 	MethodMovePort     = "MovePort"
 	MethodResetAccount = "ResetAccount"
@@ -71,8 +72,20 @@ type SetTierParams struct {
 }
 
 type AddPortParams struct {
-	AccountID int64  `json:"account_id"`
-	Port      uint16 `json:"port"`
+	AccountID int64 `json:"account_id"`
+	// Port is the range start (kept named "port" for wire back-compat: an older
+	// client sending a single port populates exactly this field).
+	Port uint16 `json:"port"`
+	// End is the range end. Optional: an older client omits it (End == 0), which
+	// the server treats as a single port (end = start).
+	End uint16 `json:"end,omitempty"`
+}
+
+type EditPortParams struct {
+	PortID int64  `json:"port_id"`
+	Start  uint16 `json:"start"`
+	// End is optional; 0 means a single port (end = start).
+	End uint16 `json:"end,omitempty"`
 }
 
 type DeletePortParams struct {

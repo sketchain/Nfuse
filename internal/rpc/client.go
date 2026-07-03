@@ -191,8 +191,12 @@ func (c *Client) SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay 
 	}, nil)
 }
 
-func (c *Client) AddPort(accountID int64, port uint16) error {
-	return c.call(MethodAddPort, AddPortParams{AccountID: accountID, Port: port}, nil)
+func (c *Client) AddPort(accountID int64, start, end uint16) error {
+	return c.call(MethodAddPort, AddPortParams{AccountID: accountID, Port: start, End: end}, nil)
+}
+
+func (c *Client) EditPort(portID int64, start, end uint16) error {
+	return c.call(MethodEditPort, EditPortParams{PortID: portID, Start: start, End: end}, nil)
 }
 
 func (c *Client) DeletePort(portID int64) error {

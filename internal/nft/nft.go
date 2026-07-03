@@ -123,13 +123,19 @@ func counterName(portID int64, dir model.Direction) string {
 }
 func quotaName(accountID int64) string { return fmt.Sprintf("acct%d", accountID) }
 
-// portMatch returns the nft expression matching a port in the given direction.
-func portMatch(dir model.Direction, port uint16) string {
+// portMatch returns the nft expression matching a port (or port range) in the
+// given direction. A single port renders as `dport 60006`; a range uses
+// nftables' native range syntax `dport 60000-60099`, matching the whole span
+// with one rule (and thus one shared counter/quota pair).
+func portMatch(dir model.Direction, p model.Port) string {
 	field := "dport"
 	if dir == model.DirOut {
 		field = "sport"
 	}
-	return fmt.Sprintf("meta l4proto { tcp, udp } th %s %d", field, port)
+	if p.Start == p.End {
+		return fmt.Sprintf("meta l4proto { tcp, udp } th %s %d", field, p.Start)
+	}
+	return fmt.Sprintf("meta l4proto { tcp, udp } th %s %d-%d", field, p.Start, p.End)
 }
 
 // buildScript renders snap into a full `nft -f` script. The add/delete/add
@@ -155,7 +161,7 @@ func (m *execManager) buildScript(snap model.Snapshot) string {
 
 	// Counters, seeded with persisted values. Sort ports for stable output.
 	ports := append([]model.Port(nil), snap.Ports...)
-	sort.Slice(ports, func(i, j int) bool { return ports[i].Port < ports[j].Port })
+	sort.Slice(ports, func(i, j int) bool { return ports[i].Start < ports[j].Start })
 	for _, p := range ports {
 		for _, dir := range []model.Direction{model.DirIn, model.DirOut} {
 			c := snap.Counters[model.CounterKey{PortID: p.ID, Dir: dir}]
@@ -178,7 +184,7 @@ func (m *execManager) buildScript(snap model.Snapshot) string {
 			if dir == model.DirOut {
 				chain = "egress"
 			}
-			match := portMatch(dir, p.Port)
+			match := portMatch(dir, p)
 			if acct.Tier.HasQuota() {
 				fmt.Fprintf(&b, "add rule %s %s %s quota name \"%s\" drop\n",
 					tbl, chain, match, quotaName(acct.ID))

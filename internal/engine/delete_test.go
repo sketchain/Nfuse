@@ -39,7 +39,7 @@ func TestDeleteAccountGuardsPortsWithoutCascade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	if err := ctrl.AddPort(id, 8080); err != nil {
+	if err := ctrl.AddPort(id, 8080, 8080); err != nil {
 		t.Fatalf("add port: %v", err)
 	}
 
@@ -70,10 +70,10 @@ func TestDeleteAccountCascade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	if err := ctrl.AddPort(id, 8080); err != nil {
+	if err := ctrl.AddPort(id, 8080, 8080); err != nil {
 		t.Fatalf("add port 8080: %v", err)
 	}
-	if err := ctrl.AddPort(id, 9090); err != nil {
+	if err := ctrl.AddPort(id, 9090, 9090); err != nil {
 		t.Fatalf("add port 9090: %v", err)
 	}
 
@@ -140,7 +140,7 @@ func TestDeleteAccountRaceGuardsAgainstConcurrentAddPort(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		var addErr, delErr error
-		go func() { defer wg.Done(); addErr = ctrl.AddPort(id, 8080) }()
+		go func() { defer wg.Done(); addErr = ctrl.AddPort(id, 8080, 8080) }()
 		go func() { defer wg.Done(); delErr = ctrl.DeleteAccount(id, false) }()
 		wg.Wait()
 

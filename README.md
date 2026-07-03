@@ -65,6 +65,23 @@ Each managed port gets **one counter per direction** (`in` = ingress/dport,
 `out` = egress/sport), so the TUI can show a per-port, per-direction breakdown.
 The egress hook requires **Linux ≥ 5.16**; Nfuse checks this at startup.
 
+#### Port ranges
+
+A managed entry may be a single port (`60006`) or a **contiguous range**
+(`60000-60099`), entered in that `start-end` form (surrounding blanks such as
+`60000 - 60099` are tolerated). A range is metered and circuit-broken **as one
+whole**: it renders as nftables' native range match (`th dport 60000-60099`) and
+gets **exactly one counter pair** (in/out) for the entire span — there is no
+per-port breakdown within a range. Its bytes fold into the owning account's
+shared quota just like any other port.
+
+Ranges (and single ports) must **not overlap** — anywhere, across all accounts.
+Adjacent ranges are fine (`60000-60099` and `60100-60199` coexist); any shared
+port number is rejected. The check is enforced atomically inside the engine's
+reconcile path (so two concurrent adds can't both slip an overlapping range in)
+and again in `Snapshot.Validate` as the last line before every kernel apply. A
+range is well-formed when `1 ≤ start ≤ end ≤ 65535`.
+
 ### Circuit breaking (kernel, named quota)
 
 All ports of one account reference the **same named `quota` object**, so the
@@ -209,12 +226,29 @@ retries until it appears — the intended behavior rather than metering the wron
 
 ### TUI keys
 
-`a` add account · `d` delete account · `p` add port · `x` delete port ·
-`m` move port · `t` change tier · `r` reset quota · `u` set usage · `q` quit
+`a` add account · `d` delete account · `p` add port · `e` edit port ·
+`x` delete port · `m` move port · `t` change tier · `r` reset quota ·
+`u` set usage · `q` quit
+
+**Adding / editing a port** accepts either form — a single port (`60006`) or a
+range (`60000-60099`). `e` edits the selected port row: renumber a single port,
+shift a range's bounds, or convert between the two, pre-filled with the current
+value. Because kernel counters are keyed by the port's internal id (not its
+number), an edit keeps the id and so **preserves the port's accumulated
+in/out counters** across the change. Sliding a range so it overlaps *its own*
+old extent (e.g. `60000-60099` → `60001-60100`) is a legal move; overlapping a
+*different* port is rejected.
 
 Deleting an account that still owns ports removes the account **and all of its
 ports** in one atomic step; the confirmation prompt names the port count first.
 A portless account is deleted directly.
+
+**Clickable help bar.** The shortcut strip at the bottom is a nano-style bar:
+every item is **mouse-clickable** and triggers exactly the same action as its
+key (same selected-row guard, same error prompts). When the terminal is too
+narrow to fit the strip on one line it **wraps** onto extra rows and the bar
+grows to fit; while a modal or form is open, clicks on the bar are swallowed by
+the overlay just like any other click outside it.
 
 The status bar shows the sampling clock (or the last error in red) plus a daemon
 line from `GetHealth`: managed **iface**, **uptime**, and **last persist** time

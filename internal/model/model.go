@@ -9,6 +9,7 @@ package model
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -111,11 +112,36 @@ func (a Account) Breached() bool {
 	return a.UsedBytes >= a.LimitBytes()
 }
 
-// Port is a metered port belonging to exactly one account.
+// Port is a metered port (or contiguous port range) belonging to exactly one
+// account. The range is the closed interval [Start, End]; a single port is the
+// degenerate case Start == End. A range is metered and circuit-broken as one
+// whole (one counter pair, one shared quota), not per-port within the range.
 type Port struct {
 	ID        int64
 	AccountID int64
-	Port      uint16
+	Start     uint16
+	End       uint16
+}
+
+// Overlaps reports whether the two closed intervals share any port number.
+// Adjacent ranges (e.g. 60000-60099 and 60100-60199) do not overlap.
+func (p Port) Overlaps(q Port) bool {
+	return p.Start <= q.End && q.Start <= p.End
+}
+
+// String renders the port for display: a bare number for a single port, or
+// "start-end" for a range.
+func (p Port) String() string {
+	if p.Start == p.End {
+		return strconv.Itoa(int(p.Start))
+	}
+	return fmt.Sprintf("%d-%d", p.Start, p.End)
+}
+
+// ValidRange reports whether the interval is well-formed: 1 ≤ Start ≤ End.
+// (End is a uint16 so it can never exceed 65535.)
+func (p Port) ValidRange() bool {
+	return p.Start >= 1 && p.Start <= p.End
 }
 
 // Counter is the persisted snapshot of one per-port, per-direction nft counter.
@@ -163,9 +189,13 @@ func (s Snapshot) Account(id int64) (Account, bool) {
 
 // Validate checks the structural invariants of the model:
 //   - every port references an existing account
-//   - a port number is unique across the whole managed set (a port belongs to
-//     exactly one account and ports do not overlap)
+//   - every port interval is well-formed (1 ≤ Start ≤ End)
+//   - no two port intervals overlap, across the whole managed set and across
+//     accounts (a port belongs to exactly one account; adjacent ranges are fine)
 //   - accounts with a quota tier have a positive limit
+//
+// This is the last-line structural guard applied before every kernel Apply; the
+// engine additionally enforces overlap atomically inside its reconcile path.
 func (s Snapshot) Validate() error {
 	accts := map[int64]bool{}
 	for _, a := range s.Accounts {
@@ -177,15 +207,19 @@ func (s Snapshot) Validate() error {
 		}
 		accts[a.ID] = true
 	}
-	seen := map[uint16]int64{}
-	for _, p := range s.Ports {
+	for i, p := range s.Ports {
 		if !accts[p.AccountID] {
-			return fmt.Errorf("port %d references unknown account %d", p.Port, p.AccountID)
+			return fmt.Errorf("port %s references unknown account %d", p, p.AccountID)
 		}
-		if owner, dup := seen[p.Port]; dup {
-			return fmt.Errorf("port %d is claimed by accounts %d and %d", p.Port, owner, p.AccountID)
+		if !p.ValidRange() {
+			return fmt.Errorf("port range %s is invalid (need 1 ≤ start ≤ end)", p)
 		}
-		seen[p.Port] = p.AccountID
+		for j := 0; j < i; j++ {
+			if q := s.Ports[j]; p.Overlaps(q) {
+				return fmt.Errorf("port range %s (account %d) overlaps %s (account %d)",
+					p, p.AccountID, q, q.AccountID)
+			}
+		}
 	}
 	return nil
 }

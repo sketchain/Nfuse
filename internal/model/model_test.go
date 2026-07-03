@@ -12,13 +12,13 @@ func TestValidate(t *testing.T) {
 			name: "ok",
 			snap: Snapshot{
 				Accounts: []Account{{ID: 1, Name: "a", Tier: TierMonthly, LimitGiB: 1}},
-				Ports:    []Port{{ID: 1, AccountID: 1, Port: 80}},
+				Ports:    []Port{{ID: 1, AccountID: 1, Start: 80, End: 80}},
 			},
 		},
 		{
 			name: "port to unknown account",
 			snap: Snapshot{
-				Ports: []Port{{ID: 1, AccountID: 99, Port: 80}},
+				Ports: []Port{{ID: 1, AccountID: 99, Start: 80, End: 80}},
 			},
 			wantErr: true,
 		},
@@ -26,7 +26,55 @@ func TestValidate(t *testing.T) {
 			name: "overlapping port across accounts",
 			snap: Snapshot{
 				Accounts: []Account{{ID: 1, Name: "a", Tier: TierUnlimited}, {ID: 2, Name: "b", Tier: TierUnlimited}},
-				Ports:    []Port{{ID: 1, AccountID: 1, Port: 80}, {ID: 2, AccountID: 2, Port: 80}},
+				Ports:    []Port{{ID: 1, AccountID: 1, Start: 80, End: 80}, {ID: 2, AccountID: 2, Start: 80, End: 80}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "adjacent ranges are legal",
+			snap: Snapshot{
+				Accounts: []Account{{ID: 1, Name: "a", Tier: TierUnlimited}, {ID: 2, Name: "b", Tier: TierUnlimited}},
+				Ports: []Port{
+					{ID: 1, AccountID: 1, Start: 60000, End: 60099},
+					{ID: 2, AccountID: 2, Start: 60100, End: 60199},
+				},
+			},
+		},
+		{
+			name: "overlapping ranges rejected",
+			snap: Snapshot{
+				Accounts: []Account{{ID: 1, Name: "a", Tier: TierUnlimited}, {ID: 2, Name: "b", Tier: TierUnlimited}},
+				Ports: []Port{
+					{ID: 1, AccountID: 1, Start: 60000, End: 60099},
+					{ID: 2, AccountID: 2, Start: 60099, End: 60199},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "range contained in single-port overlap rejected",
+			snap: Snapshot{
+				Accounts: []Account{{ID: 1, Name: "a", Tier: TierUnlimited}, {ID: 2, Name: "b", Tier: TierUnlimited}},
+				Ports: []Port{
+					{ID: 1, AccountID: 1, Start: 60050, End: 60050},
+					{ID: 2, AccountID: 2, Start: 60000, End: 60099},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "reversed bounds rejected",
+			snap: Snapshot{
+				Accounts: []Account{{ID: 1, Name: "a", Tier: TierUnlimited}},
+				Ports:    []Port{{ID: 1, AccountID: 1, Start: 200, End: 100}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero start rejected",
+			snap: Snapshot{
+				Accounts: []Account{{ID: 1, Name: "a", Tier: TierUnlimited}},
+				Ports:    []Port{{ID: 1, AccountID: 1, Start: 0, End: 0}},
 			},
 			wantErr: true,
 		},
@@ -51,6 +99,32 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("Validate() err = %v, wantErr = %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestPortStringAndOverlap(t *testing.T) {
+	if got := (Port{Start: 60006, End: 60006}).String(); got != "60006" {
+		t.Errorf("single port String() = %q, want 60006", got)
+	}
+	if got := (Port{Start: 60000, End: 60099}).String(); got != "60000-60099" {
+		t.Errorf("range String() = %q, want 60000-60099", got)
+	}
+	cases := []struct {
+		a, b Port
+		want bool
+	}{
+		{Port{Start: 60000, End: 60099}, Port{Start: 60099, End: 60199}, true},  // touch at 60099
+		{Port{Start: 60000, End: 60099}, Port{Start: 60100, End: 60199}, false}, // adjacent
+		{Port{Start: 60050, End: 60050}, Port{Start: 60000, End: 60099}, true},  // single inside range
+		{Port{Start: 8080, End: 8080}, Port{Start: 9090, End: 9090}, false},     // distinct singles
+	}
+	for _, c := range cases {
+		if got := c.a.Overlaps(c.b); got != c.want {
+			t.Errorf("%s overlaps %s = %v, want %v", c.a, c.b, got, c.want)
+		}
+		if got := c.b.Overlaps(c.a); got != c.want {
+			t.Errorf("overlap not symmetric for %s / %s", c.a, c.b)
+		}
 	}
 }
 

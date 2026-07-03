@@ -6,6 +6,7 @@ package tui
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -33,7 +34,8 @@ type Controller interface {
 	AddAccount(name string, tier model.Tier, limitGiB float64, anchorDay int) (int64, error)
 	DeleteAccount(id int64, cascade bool) error
 	SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay int) error
-	AddPort(accountID int64, port uint16) error
+	AddPort(accountID int64, start, end uint16) error
+	EditPort(portID int64, start, end uint16) error
 	DeletePort(portID int64) error
 	MovePort(portID, newAccountID int64) error
 	ResetAccount(id int64) error
@@ -46,6 +48,8 @@ type UI struct {
 	pages   *tview.Pages
 	table   *tview.Table
 	status  *tview.TextView
+	help    *tview.TextView
+	main    *tview.Flex
 	ctrl    Controller
 	refresh time.Duration
 
@@ -89,7 +93,44 @@ type rowRef struct {
 	accountID int64
 	account   model.Account
 	portID    int64
-	port      uint16
+	start     uint16
+	end       uint16
+}
+
+// portLabel renders a port row's interval: a bare number for a single port, or
+// "start-end" for a range.
+func portLabel(start, end uint16) string {
+	if start == end {
+		return strconv.Itoa(int(start))
+	}
+	return fmt.Sprintf("%d-%d", start, end)
+}
+
+// parsePortSpec accepts either a single port ("60006") or a closed range
+// ("60000-60099", with optional surrounding blanks like "60000 - 60099") and
+// returns the interval. A single port yields start == end. It rejects malformed
+// input, out-of-range values and reversed bounds with a clear message.
+func parsePortSpec(s string) (start, end uint16, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, fmt.Errorf("empty port")
+	}
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		lo, err1 := strconv.Atoi(strings.TrimSpace(s[:i]))
+		hi, err2 := strconv.Atoi(strings.TrimSpace(s[i+1:]))
+		if err1 != nil || err2 != nil {
+			return 0, 0, fmt.Errorf("invalid port range %q", s)
+		}
+		if lo < 1 || hi > 65535 || lo > hi {
+			return 0, 0, fmt.Errorf("port range must be 1-65535 with start ≤ end, got %q", s)
+		}
+		return uint16(lo), uint16(hi), nil
+	}
+	p, perr := strconv.Atoi(s)
+	if perr != nil || p < 1 || p > 65535 {
+		return 0, 0, fmt.Errorf("invalid port %q", s)
+	}
+	return uint16(p), uint16(p), nil
 }
 
 // New builds the UI over the given controller.
@@ -113,6 +154,32 @@ func New(ctrl Controller, refresh time.Duration) *UI {
 	return u
 }
 
+// helpItem is one entry in the bottom shortcut bar: a key, its region id (equal
+// to the key rune) and the label shown next to it.
+type helpItem struct {
+	key   rune
+	label string
+}
+
+// helpItems is the nano-style shortcut bar, in display order. Clicking an item
+// runs exactly the same handler as pressing its key (see dispatch).
+var helpItems = []helpItem{
+	{'a', "add acct"},
+	{'d', "del acct(+ports)"},
+	{'p', "add port"},
+	{'e', "edit port"},
+	{'x', "del port"},
+	{'m', "move port"},
+	{'t', "tier"},
+	{'r', "reset"},
+	{'u', "set usage"},
+	{'q', "quit"},
+}
+
+// helpItemSep is the run of spaces drawn between shortcut items. It counts toward
+// the wrapped-width computation in helpHeight.
+const helpItemSep = "  "
+
 func (u *UI) buildLayout() {
 	u.table.SetBorders(false).
 		SetSelectable(true, false).
@@ -120,21 +187,95 @@ func (u *UI) buildLayout() {
 	u.table.SetBorder(true).SetTitle(" Nfuse — accounts / ports ")
 
 	u.status.SetBorder(true).SetTitle(" status ")
-	help := tview.NewTextView().SetDynamicColors(true)
-	help.SetText("[yellow]a[-] add acct  [yellow]d[-] del acct(+ports)  [yellow]p[-] add port  [yellow]x[-] del port  [yellow]m[-] move port  [yellow]t[-] tier  [yellow]r[-] reset  [yellow]u[-] set usage  [yellow]q[-] quit")
-	help.SetBorder(true).SetTitle(" keys ")
 
-	main := tview.NewFlex().SetDirection(tview.FlexRow).
+	// The help bar is a nano-style shortcut strip: each item is a clickable region
+	// and the whole strip character-wraps when the terminal is too narrow for one
+	// line. Character wrap (word wrap off) fills each row fully, so the wrapped
+	// height is exactly ceil(visibleWidth / innerWidth) — see helpHeight.
+	u.help = tview.NewTextView().
+		SetDynamicColors(true).
+		SetRegions(true).
+		SetWrap(true).
+		SetWordWrap(false)
+	u.help.SetText(helpMarkup())
+	u.help.SetBorder(true).SetTitle(" keys ")
+	// A click on a region highlights it and fires this handler; we translate the
+	// region id (the key rune) into the same action a key press would trigger,
+	// then clear the highlight so the item can be clicked again and nothing stays
+	// visually stuck. The added-length guard ignores the clear's own callback.
+	u.help.SetHighlightedFunc(func(added, _, _ []string) {
+		if len(added) == 0 {
+			return
+		}
+		region := added[0]
+		u.help.Highlight() // clear; re-enters this func with added empty (ignored)
+		if r := []rune(region); len(r) == 1 {
+			u.dispatch(r[0])
+		}
+	})
+
+	u.main = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(u.table, 0, 1, true).
 		AddItem(u.status, 4, 0, false).
-		AddItem(help, 3, 0, false)
+		AddItem(u.help, 3, 0, false)
 
-	u.pages.AddPage("main", main, true, true)
+	u.pages.AddPage("main", u.main, true, true)
 	u.app.SetRoot(u.pages, true).EnableMouse(true)
+	// Before each draw, size the help bar to however many rows it wraps to at the
+	// current terminal width, so a narrow terminal gets a taller (multi-line) bar
+	// and nothing is truncated.
+	u.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		w, _ := screen.Size()
+		u.main.ResizeItem(u.help, u.helpHeight(w), 0)
+		return false
+	})
 	u.table.SetInputCapture(u.onKey)
 	// Track the selected entity by identity whenever the row selection changes
 	// (via keyboard navigation or a click on the table), so it survives rebuilds.
 	u.table.SetSelectionChangedFunc(u.onSelectionChanged)
+}
+
+// helpMarkup renders the shortcut bar text: each item wrapped in its own region
+// (id = the key rune) with the key highlighted, joined by helpItemSep.
+func helpMarkup() string {
+	var b strings.Builder
+	for i, it := range helpItems {
+		if i > 0 {
+			b.WriteString(helpItemSep)
+		}
+		fmt.Fprintf(&b, `["%c"][yellow]%c[-] %s[""]`, it.key, it.key, it.label)
+	}
+	return b.String()
+}
+
+// helpVisibleWidth is the on-screen width of the shortcut strip laid out on one
+// line, excluding the zero-width color/region tags.
+func helpVisibleWidth() int {
+	w := 0
+	for i, it := range helpItems {
+		if i > 0 {
+			w += len(helpItemSep)
+		}
+		w += 1 + 1 + len(it.label) // key rune + space + label
+	}
+	return w
+}
+
+// helpHeight returns the bordered height the help bar needs at terminal width
+// totalWidth: the number of character-wrapped text rows plus 2 for the border.
+// Character wrapping (word wrap off) packs each row to the full inner width, so
+// the row count is ceil(visibleWidth / innerWidth).
+func (u *UI) helpHeight(totalWidth int) int {
+	inner := totalWidth - 2 // left/right border columns
+	if inner <= 0 {
+		return 3
+	}
+	vis := helpVisibleWidth()
+	rows := (vis + inner - 1) / inner
+	if rows < 1 {
+		rows = 1
+	}
+	return rows + 2 // top/bottom border rows
 }
 
 // onSelectionChanged records the entity behind the newly selected row so the
@@ -203,11 +344,11 @@ func (u *UI) render() {
 
 		for _, p := range av.Ports {
 			u.setRow(row, []string{
-				"   port", "", strconv.Itoa(int(p.Port)),
+				"   port", "", portLabel(p.Start, p.End),
 				model.FormatBytes(p.InBytes), model.FormatBytes(p.OutBytes),
 				"", "", "",
 			}, tcell.ColorGray)
-			u.rowRef[row] = rowRef{kind: rowPort, accountID: a.ID, account: a, portID: p.PortID, port: p.Port}
+			u.rowRef[row] = rowRef{kind: rowPort, accountID: a.ID, account: a, portID: p.PortID, start: p.Start, end: p.End}
 			row++
 		}
 	}
@@ -350,40 +491,46 @@ func (u *UI) firstSelectableRow() int {
 }
 
 func (u *UI) onKey(ev *tcell.EventKey) *tcell.EventKey {
-	switch ev.Rune() {
-	case 'q':
-		u.app.Stop()
-		return nil
-	case 'a':
-		u.formAddAccount()
-		return nil
-	case 'd':
-		u.doDeleteAccount()
-		return nil
-	case 'p':
-		u.formAddPort()
-		return nil
-	case 'x':
-		u.doDeletePort()
-		return nil
-	case 'm':
-		u.formMovePort()
-		return nil
-	case 't':
-		u.formChangeTier()
-		return nil
-	case 'r':
-		u.doReset()
-		return nil
-	case 'u':
-		u.formSetUsage()
-		return nil
-	}
 	if ev.Key() == tcell.KeyCtrlC {
 		u.app.Stop()
 		return nil
 	}
+	if u.dispatch(ev.Rune()) {
+		return nil
+	}
 	return ev
+}
+
+// dispatch runs the action bound to key rune r, returning whether it was
+// handled. It is the single entry point shared by keyboard input (onKey) and
+// clicks on the shortcut bar (SetHighlightedFunc), so a click behaves exactly
+// like the corresponding key press — same selected-row guards, same errors.
+func (u *UI) dispatch(r rune) bool {
+	switch r {
+	case 'q':
+		u.app.Stop()
+	case 'a':
+		u.formAddAccount()
+	case 'd':
+		u.doDeleteAccount()
+	case 'p':
+		u.formAddPort()
+	case 'e':
+		u.formEditPort()
+	case 'x':
+		u.doDeletePort()
+	case 'm':
+		u.formMovePort()
+	case 't':
+		u.formChangeTier()
+	case 'r':
+		u.doReset()
+	case 'u':
+		u.formSetUsage()
+	default:
+		return false
+	}
+	return true
 }
 
 // ── Modals & forms ───────────────────────────────────────────────────────────
@@ -534,23 +681,56 @@ func (u *UI) formAddPort() {
 	acctName := ref.account.Name
 	form := tview.NewForm()
 	form.AddTextView("Account", acctName, 30, 1, true, false)
-	form.AddInputField("Port", "", 8, tview.InputFieldInteger, nil)
+	// Accepts a single port (60006) or a range (60000-60099).
+	form.AddInputField("Port / range", "", 16, nil, nil)
 	form.AddButton("Add", func() {
-		portStr := form.GetFormItemByLabel("Port").(*tview.InputField).GetText()
-		p, err := strconv.Atoi(portStr)
+		spec := form.GetFormItemByLabel("Port / range").(*tview.InputField).GetText()
+		start, end, err := parsePortSpec(spec)
 		u.closeForm()
-		if err != nil || p < 1 || p > 65535 {
-			u.errf("invalid port %q", portStr)
+		if err != nil {
+			u.errf("%v", err)
 			return
 		}
-		if err := u.ctrl.AddPort(acctID, uint16(p)); err != nil {
+		if err := u.ctrl.AddPort(acctID, start, end); err != nil {
 			u.errf("add port: %v", err)
 			return
 		}
 		u.render()
 	})
 	form.AddButton("Cancel", u.closeForm)
-	u.showForm(form, "Add port", 9)
+	u.showForm(form, "Add port / range", 9)
+}
+
+// formEditPort edits the selected port's number or range boundaries. It accepts
+// the same single-port or range syntax as add, pre-filled with the current
+// value; the engine's exclude-self overlap check makes sliding a range onto its
+// own old extent a legal move.
+func (u *UI) formEditPort() {
+	ref, ok := u.selected()
+	if !ok || ref.kind != rowPort {
+		u.errf("select a port row first")
+		return
+	}
+	portID := ref.portID
+	cur := portLabel(ref.start, ref.end)
+	form := tview.NewForm()
+	form.AddInputField("Port / range", cur, 16, nil, nil)
+	form.AddButton("Save", func() {
+		spec := form.GetFormItemByLabel("Port / range").(*tview.InputField).GetText()
+		start, end, err := parsePortSpec(spec)
+		u.closeForm()
+		if err != nil {
+			u.errf("%v", err)
+			return
+		}
+		if err := u.ctrl.EditPort(portID, start, end); err != nil {
+			u.errf("edit port: %v", err)
+			return
+		}
+		u.render()
+	})
+	form.AddButton("Cancel", u.closeForm)
+	u.showForm(form, "Edit port "+cur, 9)
 }
 
 func (u *UI) doDeletePort() {
@@ -559,7 +739,7 @@ func (u *UI) doDeletePort() {
 		u.errf("select a port row first")
 		return
 	}
-	u.modal(fmt.Sprintf("Delete port %d?", ref.port), []string{"Delete", "Cancel"}, func(i int, _ string) {
+	u.modal(fmt.Sprintf("Delete port %s?", portLabel(ref.start, ref.end)), []string{"Delete", "Cancel"}, func(i int, _ string) {
 		u.closeModal()
 		if i != 0 {
 			return
@@ -579,7 +759,7 @@ func (u *UI) formMovePort() {
 		return
 	}
 	portID := ref.portID
-	port := ref.port
+	portStr := portLabel(ref.start, ref.end)
 
 	// Offer every account as a destination.
 	views, _ := u.ctrl.View()
@@ -598,7 +778,7 @@ func (u *UI) formMovePort() {
 		return
 	}
 	form := tview.NewForm()
-	form.AddTextView("Port", strconv.Itoa(int(port)), 30, 1, true, false)
+	form.AddTextView("Port", portStr, 30, 1, true, false)
 	form.AddDropDown("Destination", labels, cur, nil)
 	form.AddButton("Move", func() {
 		idx, _ := form.GetFormItemByLabel("Destination").(*tview.DropDown).GetCurrentOption()

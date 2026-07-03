@@ -88,6 +88,17 @@ type fakeCtrl struct {
 	deleteCalled  bool
 	deleteID      int64
 	deleteCascade bool
+
+	addCalled bool
+	addAcct   int64
+	addStart  uint16
+	addEnd    uint16
+
+	editCalled bool
+	editPortID int64
+	editStart  uint16
+	editEnd    uint16
+	nextPortID int64
 }
 
 func (f *fakeCtrl) View() ([]engine.AccountView, string) {
@@ -115,7 +126,42 @@ func (f *fakeCtrl) DeleteAccount(id int64, cascade bool) error {
 }
 
 func (f *fakeCtrl) SetTier(int64, model.Tier, float64, int) error { return nil }
-func (f *fakeCtrl) AddPort(int64, uint16) error                   { return nil }
+
+func (f *fakeCtrl) AddPort(accountID int64, start, end uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addCalled = true
+	f.addAcct = accountID
+	f.addStart = start
+	f.addEnd = end
+	f.nextPortID++
+	pid := 1000 + f.nextPortID
+	for i := range f.accounts {
+		if f.accounts[i].Account.ID == accountID {
+			f.accounts[i].Ports = append(f.accounts[i].Ports,
+				engine.PortView{PortID: pid, Start: start, End: end})
+		}
+	}
+	return nil
+}
+
+func (f *fakeCtrl) EditPort(portID int64, start, end uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.editCalled = true
+	f.editPortID = portID
+	f.editStart = start
+	f.editEnd = end
+	for i := range f.accounts {
+		for j := range f.accounts[i].Ports {
+			if f.accounts[i].Ports[j].PortID == portID {
+				f.accounts[i].Ports[j].Start = start
+				f.accounts[i].Ports[j].End = end
+			}
+		}
+	}
+	return nil
+}
 
 func (f *fakeCtrl) DeletePort(portID int64) error {
 	f.mu.Lock()
@@ -142,16 +188,22 @@ func oneAccountTwoPorts() *fakeCtrl {
 	return &fakeCtrl{accounts: []engine.AccountView{{
 		Account: model.Account{ID: 1, Name: "alice", Tier: model.TierMonthly, LimitGiB: 1, BillingAnchorDay: 15},
 		Ports: []engine.PortView{
-			{PortID: 10, Port: 8080},
-			{PortID: 20, Port: 9090},
+			{PortID: 10, Start: 8080, End: 8080},
+			{PortID: 20, Start: 9090, End: 9090},
 		},
 	}}}
 }
 
-// testUI starts the real UI over a simulation screen and returns handles plus a
-// cleanup func. The refresh interval is set huge so the only renders are the
-// ones the test triggers, keeping the sequence deterministic.
+// testUI starts the real UI over a 120×40 simulation screen. See testUISized.
 func testUI(t *testing.T, ctrl Controller) (*UI, tcell.SimulationScreen, func()) {
+	return testUISized(t, ctrl, 120, 40)
+}
+
+// testUISized starts the real UI over a simulation screen of the given size and
+// returns handles plus a cleanup func. The refresh interval is set huge so the
+// only renders are the ones the test triggers, keeping the sequence
+// deterministic.
+func testUISized(t *testing.T, ctrl Controller, w, h int) (*UI, tcell.SimulationScreen, func()) {
 	t.Helper()
 	// Collapse the double-click window so two clicks issued by a test are never
 	// coalesced into a double-click.
@@ -160,7 +212,7 @@ func testUI(t *testing.T, ctrl Controller) (*UI, tcell.SimulationScreen, func())
 	u := New(ctrl, time.Hour)
 	screen := tcell.NewSimulationScreen("UTF-8")
 	u.app.SetScreen(screen) // also initializes the screen
-	screen.SetSize(120, 40)
+	screen.SetSize(w, h)
 	u.render() // initial build before the loop starts (no concurrency yet)
 
 	done := make(chan error, 1)
@@ -175,6 +227,29 @@ func testUI(t *testing.T, ctrl Controller) (*UI, tcell.SimulationScreen, func())
 		}
 	}
 	return u, screen, cleanup
+}
+
+// typeString injects each rune of s as a key event to the focused primitive.
+func typeString(screen tcell.SimulationScreen, s string) {
+	for _, r := range s {
+		screen.InjectKey(tcell.KeyRune, r, tcell.ModNone)
+	}
+}
+
+// backspaces injects n backspace key events to clear a focused input field.
+func backspaces(screen tcell.SimulationScreen, n int) {
+	for i := 0; i < n; i++ {
+		screen.InjectKey(tcell.KeyBackspace2, 0, tcell.ModNone)
+	}
+}
+
+// submitForm activates a form's first button from its focused input field: Tab
+// advances focus from the input to the first (primary) button, Enter activates
+// it. This is more robust than pixel-clicking short button labels, whose narrow
+// hit-rect makes text-scanned coordinates land just off the button.
+func submitForm(screen tcell.SimulationScreen) {
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
 }
 
 // onLoop runs f on the application's event-loop goroutine and returns its
@@ -453,4 +528,174 @@ func TestSelectionSurvivesRerenders(t *testing.T) {
 	if ref.kind != rowAccount || ref.accountID != 1 {
 		t.Fatalf("after deleting the selected port, selection = %+v, want account 1", ref)
 	}
+}
+
+// TestAddPortRangeInput covers the port-range feature end to end through the UI:
+// selecting an account, opening the add-port form, typing a range and confirming
+// forwards the parsed [start,end] interval to the controller.
+func TestAddPortRangeInput(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUI(t, ctrl)
+	defer cleanup()
+
+	waitFor(t, u.app, "account selected", func() bool {
+		ref, ok := curSel(u)
+		return ok && ref.kind == rowAccount && ref.accountID == 1
+	})
+
+	pressRune(screen, 'p')
+	waitFor(t, u.app, "add-port form open", func() bool { return u.pages.HasPage("form") })
+
+	typeString(screen, "60000-60099")
+	submitForm(screen)
+
+	waitFor(t, u.app, "AddPort forwarded", func() bool {
+		ctrl.mu.Lock()
+		defer ctrl.mu.Unlock()
+		return ctrl.addCalled
+	})
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.addAcct != 1 || ctrl.addStart != 60000 || ctrl.addEnd != 60099 {
+		t.Fatalf("AddPort(acct=%d, %d-%d), want (1, 60000-60099)", ctrl.addAcct, ctrl.addStart, ctrl.addEnd)
+	}
+}
+
+// TestAddPortInvalidFormat covers the parse-error path: a malformed port spec is
+// rejected with an error modal and never reaches the controller.
+func TestAddPortInvalidFormat(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUI(t, ctrl)
+	defer cleanup()
+
+	waitFor(t, u.app, "account selected", func() bool {
+		ref, ok := curSel(u)
+		return ok && ref.kind == rowAccount
+	})
+
+	pressRune(screen, 'p')
+	waitFor(t, u.app, "add-port form open", func() bool { return u.pages.HasPage("form") })
+
+	typeString(screen, "not-a-port")
+	submitForm(screen)
+
+	// The parse error surfaces as a modal, and the controller is never called.
+	waitFor(t, u.app, "error modal shown", func() bool { return u.pages.HasPage("modal") })
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.addCalled {
+		t.Fatal("AddPort was called despite an invalid port spec")
+	}
+}
+
+// TestEditPortFlow covers the edit-port feature: pressing 'e' on a selected port
+// opens a form pre-filled with the current value, and saving a new range forwards
+// EditPort with the same port id and the parsed interval (single → range here).
+func TestEditPortFlow(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUI(t, ctrl)
+	defer cleanup()
+
+	// Select the 8080 port row (screen row 3).
+	clickAt(screen, 6, 3)
+	waitFor(t, u.app, "port 8080 selected", func() bool {
+		ref, ok := curSel(u)
+		return ok && ref.kind == rowPort && ref.portID == 10
+	})
+
+	pressRune(screen, 'e')
+	waitFor(t, u.app, "edit-port form open", func() bool { return u.pages.HasPage("form") })
+
+	// The form is pre-filled with "8080"; clear it and enter a range.
+	backspaces(screen, 6)
+	typeString(screen, "60001-60100")
+	submitForm(screen)
+
+	waitFor(t, u.app, "EditPort forwarded", func() bool {
+		ctrl.mu.Lock()
+		defer ctrl.mu.Unlock()
+		return ctrl.editCalled
+	})
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.editPortID != 10 || ctrl.editStart != 60001 || ctrl.editEnd != 60100 {
+		t.Fatalf("EditPort(id=%d, %d-%d), want (10, 60001-60100)", ctrl.editPortID, ctrl.editStart, ctrl.editEnd)
+	}
+}
+
+// TestEditPortRequiresPortRow covers the guard: pressing 'e' on an account row
+// (not a port) shows an error and does not open a form.
+func TestEditPortRequiresPortRow(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUI(t, ctrl)
+	defer cleanup()
+
+	waitFor(t, u.app, "account selected", func() bool {
+		ref, ok := curSel(u)
+		return ok && ref.kind == rowAccount
+	})
+
+	pressRune(screen, 'e')
+	waitFor(t, u.app, "error modal shown", func() bool { return u.pages.HasPage("modal") })
+	if onLoop(u.app, func() bool { return u.pages.HasPage("form") }) {
+		t.Fatal("edit form opened for a non-port selection")
+	}
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.editCalled {
+		t.Fatal("EditPort called for a non-port selection")
+	}
+}
+
+// TestHelpBarClickTriggersAction covers the clickable help bar: clicking an item
+// runs exactly the same handler as pressing its key (here 'a', which opens the
+// add-account form).
+func TestHelpBarClickTriggersAction(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUI(t, ctrl)
+	defer cleanup()
+
+	waitFor(t, u.app, "initial render", func() bool { return len(u.rowRef) > 0 })
+
+	// The help bar renders "a add acct"; clicking that item must open the
+	// add-account form just as pressing 'a' would.
+	bx, by, ok := findText(screen, "add acct")
+	if !ok {
+		t.Fatal("'add acct' shortcut not found in the help bar")
+	}
+	clickAt(screen, bx, by)
+	waitFor(t, u.app, "add-account form opened by help click", func() bool {
+		return u.pages.HasPage("form")
+	})
+}
+
+// TestHelpBarWrapsAndClickableWhenNarrow covers the auto-wrapping requirement: on
+// a narrow terminal the help bar grows to multiple rows, and each item is still
+// clickable (the wrapped layout preserves region hit-testing).
+func TestHelpBarWrapsAndClickableWhenNarrow(t *testing.T) {
+	ctrl := oneAccountTwoPorts()
+	u, screen, cleanup := testUISized(t, ctrl, 40, 30)
+	defer cleanup()
+
+	waitFor(t, u.app, "initial render", func() bool { return len(u.rowRef) > 0 })
+
+	// At width 40 the strip cannot fit on one line, so the bordered help box must
+	// be taller than the single-line height of 3.
+	if h := u.helpHeight(40); h <= 3 {
+		t.Fatalf("help height at width 40 = %d, want > 3 (wrapped to multiple rows)", h)
+	}
+	if h := u.helpHeight(200); h != 3 {
+		t.Fatalf("help height at width 200 = %d, want 3 (single line)", h)
+	}
+
+	// An item on the first wrapped row must still be clickable and trigger its
+	// action (here 'a' → add-account form).
+	bx, by, ok := findText(screen, "add acct")
+	if !ok {
+		t.Fatal("'add acct' shortcut not found on the narrow help bar")
+	}
+	clickAt(screen, bx, by)
+	waitFor(t, u.app, "add-account form opened by narrow help click", func() bool {
+		return u.pages.HasPage("form")
+	})
 }

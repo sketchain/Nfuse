@@ -62,10 +62,10 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("want 1 account, got %d", len(views))
 	}
 	aid := views[0].Account.ID
-	if err := ctrl.AddPort(aid, 8080); err != nil {
+	if err := ctrl.AddPort(aid, 8080, 8080); err != nil {
 		t.Fatalf("add port 8080: %v", err)
 	}
-	if err := ctrl.AddPort(aid, 9090); err != nil {
+	if err := ctrl.AddPort(aid, 9090, 9090); err != nil {
 		t.Fatalf("add port 9090: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// Duplicate port must be rejected.
-	if err := ctrl.AddPort(aid, 8080); err == nil {
+	if err := ctrl.AddPort(aid, 8080, 8080); err == nil {
 		t.Errorf("expected duplicate port rejection")
 	}
 
@@ -94,7 +94,7 @@ func TestIntegration(t *testing.T) {
 	views, _ = ctrl.View()
 	var moved bool
 	for _, p := range views[0].Ports {
-		if p.Port == 9090 && (p.InBytes > 0 || p.OutBytes > 0) {
+		if p.Start == 9090 && (p.InBytes > 0 || p.OutBytes > 0) {
 			moved = true
 		}
 	}
@@ -132,7 +132,7 @@ func TestIntegration(t *testing.T) {
 	// Delete ports then account.
 	for _, p := range views[0].Ports {
 		if err := ctrl.DeletePort(p.PortID); err != nil {
-			t.Fatalf("delete port %d: %v", p.Port, err)
+			t.Fatalf("delete port %d-%d: %v", p.Start, p.End, err)
 		}
 	}
 	if err := ctrl.DeleteAccount(aid, false); err != nil {
@@ -165,7 +165,7 @@ func TestPersistenceBackfill(t *testing.T) {
 	}
 	views, _ := ctrl.View()
 	aid := views[0].Account.ID
-	if err := ctrl.AddPort(aid, 7070); err != nil {
+	if err := ctrl.AddPort(aid, 7070, 7070); err != nil {
 		t.Fatalf("add port: %v", err)
 	}
 	// Simulate accumulated usage by setting it through the engine (SetUsage seeds

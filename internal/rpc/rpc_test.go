@@ -66,8 +66,9 @@ func (f *fakeBackend) DeleteAccount(id int64, cascade bool) error {
 func (f *fakeBackend) SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay int) error {
 	return nil
 }
-func (f *fakeBackend) AddPort(accountID int64, port uint16) error { return nil }
-func (f *fakeBackend) DeletePort(portID int64) error              { return nil }
+func (f *fakeBackend) AddPort(accountID int64, start, end uint16) error { return nil }
+func (f *fakeBackend) EditPort(portID int64, start, end uint16) error   { return nil }
+func (f *fakeBackend) DeletePort(portID int64) error                    { return nil }
 
 func (f *fakeBackend) MovePort(portID, newAccountID int64) error {
 	f.mu.Lock()

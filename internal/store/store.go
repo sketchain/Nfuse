@@ -51,6 +51,12 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
+	// The ports table stores a closed range [port, "end"]. A single port is the
+	// degenerate case "end" == port. The `port` column is no longer UNIQUE: the
+	// old "one row per port number" rule is superseded by interval non-overlap,
+	// enforced in the engine's reconcile path and in Snapshot.Validate. (Fresh
+	// databases omit the constraint; legacy databases may still carry it, which
+	// is harmless — non-overlapping ranges always have distinct start ports.)
 	const schema = `
 CREATE TABLE IF NOT EXISTS accounts (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +70,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS ports (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    port       INTEGER NOT NULL UNIQUE
+    port       INTEGER NOT NULL,
+    "end"      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS counters (
     port_id INTEGER NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
@@ -74,8 +81,54 @@ CREATE TABLE IF NOT EXISTS counters (
     PRIMARY KEY (port_id, dir)
 );
 `
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	return s.migratePortRange()
+}
+
+// migratePortRange brings a pre-range database up to the [port, "end"] schema.
+// Older databases created the ports table without an "end" column; add it and
+// backfill "end" = port so every legacy single port becomes the closed range
+// [port, port]. The whole step is idempotent: on a database that already has the
+// column and backfilled rows, the ALTER is skipped and the UPDATE matches no
+// rows (a valid range always has "end" ≥ port ≥ 1, so "end" == 0 unambiguously
+// marks an un-backfilled row).
+func (s *Store) migratePortRange() error {
+	hasEnd, err := s.columnExists("ports", "end")
+	if err != nil {
+		return err
+	}
+	if !hasEnd {
+		if _, err := s.db.Exec(`ALTER TABLE ports ADD COLUMN "end" INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	_, err = s.db.Exec(`UPDATE ports SET "end" = port WHERE "end" = 0`)
 	return err
+}
+
+// columnExists reports whether the given table has a column of the given name.
+func (s *Store) columnExists(table, column string) (bool, error) {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dfltValue        any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Load reads the full desired-state snapshot from the database.
@@ -99,18 +152,19 @@ func (s *Store) Load() (model.Snapshot, error) {
 		return snap, err
 	}
 
-	prows, err := s.db.Query(`SELECT id, account_id, port FROM ports ORDER BY port`)
+	prows, err := s.db.Query(`SELECT id, account_id, port, "end" FROM ports ORDER BY port`)
 	if err != nil {
 		return snap, err
 	}
 	for prows.Next() {
 		var p model.Port
-		var port int
-		if err := prows.Scan(&p.ID, &p.AccountID, &port); err != nil {
+		var start, end int
+		if err := prows.Scan(&p.ID, &p.AccountID, &start, &end); err != nil {
 			prows.Close()
 			return snap, err
 		}
-		p.Port = uint16(port)
+		p.Start = uint16(start)
+		p.End = uint16(end)
 		snap.Ports = append(snap.Ports, p)
 	}
 	prows.Close()
@@ -168,7 +222,8 @@ func (s *Store) CreatePort(p model.Port) (int64, error) {
 	}
 	defer tx.Rollback()
 
-	res, err := tx.Exec(`INSERT INTO ports (account_id, port) VALUES (?, ?)`, p.AccountID, int(p.Port))
+	res, err := tx.Exec(`INSERT INTO ports (account_id, port, "end") VALUES (?, ?, ?)`,
+		p.AccountID, int(p.Start), int(p.End))
 	if err != nil {
 		return 0, err
 	}
@@ -194,6 +249,15 @@ func (s *Store) DeletePort(id int64) error {
 // id, so they follow the port unchanged.
 func (s *Store) MovePort(portID, newAccountID int64) error {
 	_, err := s.db.Exec(`UPDATE ports SET account_id = ? WHERE id = ?`, newAccountID, portID)
+	return err
+}
+
+// EditPort rewrites a port's interval boundaries. The row's id is unchanged, so
+// its counters (keyed by port id) follow the edit intact and historical usage is
+// preserved across the reconcile rebuild.
+func (s *Store) EditPort(portID int64, start, end uint16) error {
+	_, err := s.db.Exec(`UPDATE ports SET port = ?, "end" = ? WHERE id = ?`,
+		int(start), int(end), portID)
 	return err
 }
 

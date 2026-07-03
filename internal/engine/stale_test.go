@@ -123,7 +123,7 @@ func TestReconcileFoldsFreshSample(t *testing.T) {
 	}
 
 	// Any mutation triggers reconcile, which must fresh-sample first.
-	if err := c.AddPort(id, 8080); err != nil {
+	if err := c.AddPort(id, 8080, 8080); err != nil {
 		t.Fatalf("AddPort: %v", err)
 	}
 	if mgr.sampled == 0 {
@@ -159,7 +159,7 @@ func TestReconcileAbortsOnSampleFailure(t *testing.T) {
 	}
 	mgr.exists = true // now sampling will be attempted, and it fails
 
-	if err := c.AddPort(id, 8080); err == nil {
+	if err := c.AddPort(id, 8080, 8080); err == nil {
 		t.Fatalf("reconcile should abort when a live table cannot be sampled")
 	}
 }
