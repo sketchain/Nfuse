@@ -1,0 +1,122 @@
+name: Release
+
+# Build every target and publish a GitHub Release whenever changes land on main
+# (i.e. after a PR is merged). Can also be triggered manually.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only create a release once tests pass and the binaries build.
+permissions:
+  contents: write # required to create tags and releases
+
+# Never run two releases for the same branch at once; let the newest win.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        # Unit tests always run; the nftables integration tests self-skip when
+        # nft/root are unavailable on the runner.
+        run: go test ./...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the release notes can diff tags
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Derive version
+        id: meta
+        run: |
+          # Monotonic, tag-safe version derived from the run number.
+          VERSION="v0.1.${{ github.run_number }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION"
+
+      - name: Build all targets
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Nfuse drives nftables netdev hooks and reads /proc, so it is a
+          # Linux-only tool; we ship every mainstream Linux architecture.
+          # The pure-Go SQLite driver lets us cross-compile with CGO disabled.
+          #
+          # Each target is packaged as nfuse-<arch>.tar.gz — the arch named the
+          # Go (GOARCH) way, with no version in the filename — holding exactly one
+          # file: the executable `nfuse` with its execute bit set. No README,
+          # LICENSE, directory prefix or anything else goes in the archive.
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}"
+          build() {
+            local goarch="$1" goarm="$2" arch="$3"
+            echo "==> nfuse-${arch}.tar.gz (GOARCH=${goarch}${goarm:+ GOARM=$goarm})"
+            local staging
+            staging="$(mktemp -d)"
+            env CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" \
+              go build -trimpath -ldflags "$LDFLAGS" -o "$staging/nfuse" .
+            chmod +x "$staging/nfuse"
+            # -C so the archive's sole entry is a bare `nfuse` with no dir prefix;
+            # tar preserves the execute bit set above.
+            tar -czf "dist/nfuse-${arch}.tar.gz" -C "$staging" nfuse
+            rm -rf "$staging"
+          }
+          build amd64 ""  amd64
+          build arm64 ""  arm64
+          build arm   7   armv7
+          build 386   ""  386
+          ( cd dist && sha256sum nfuse-*.tar.gz > SHA256SUMS.txt )
+          echo "Artifacts:"; ls -la dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          set -euo pipefail
+          NOTES="$(mktemp)"
+          {
+            echo "Automated release built from \`main\` @ \`${COMMIT}\`."
+            echo
+            echo "Linux binaries (pure Go, statically linked, CGO disabled)."
+            echo "Each asset is a .tar.gz holding a single executable \`nfuse\` — extract and run."
+            echo
+            echo "| Asset | Arch |"
+            echo "|-------|------|"
+            echo "| nfuse-amd64.tar.gz | x86-64 (amd64) |"
+            echo "| nfuse-arm64.tar.gz | ARM64 (arm64) |"
+            echo "| nfuse-armv7.tar.gz | ARMv7 (32-bit) |"
+            echo "| nfuse-386.tar.gz | x86 (32-bit, 386) |"
+            echo
+            echo "Verify with \`sha256sum -c SHA256SUMS.txt\`."
+            echo "Requires Linux >= 5.16 (nftables netdev egress hook) and root."
+          } > "$NOTES"
+          gh release create "$VERSION" dist/nfuse-*.tar.gz dist/SHA256SUMS.txt \
+            --title "$VERSION" \
+            --notes-file "$NOTES" \
+            --target "$GITHUB_SHA"
