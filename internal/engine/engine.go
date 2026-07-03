@@ -216,6 +216,14 @@ func (c *Controller) persistLoop() {
 
 // persistNow writes the latest sampled values to SQLite. Runs on the persist
 // goroutine, never on the sampling path.
+//
+// The DB write below happens outside c.mu and without a gen guard, and that is
+// safe: kernel counters and quota "used" bytes only ever increase between
+// mutations, so a stale persist can at worst write a slightly-old value that the
+// next sample immediately heals upward. The one operation that *lowers* usage —
+// a reset — is the sole exception, and it is now funneled through reconcile
+// (under c.mu, with gen++), so persistNow can never race a reset into reviving
+// pre-reset usage.
 func (c *Controller) persistNow() error {
 	c.mu.Lock()
 	used := make(map[int64]uint64, len(c.live.AccountUsed))
@@ -497,28 +505,26 @@ func (c *Controller) ResetAccount(id int64) error {
 	if !acct.Tier.HasQuota() {
 		return fmt.Errorf("account %q has no quota to reset", acct.Name)
 	}
-	if err := c.nft.ResetQuota(id); err != nil {
-		return err
-	}
-	now := time.Now()
-	if err := c.store.MarkReset(id, now); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	for i := range c.snap.Accounts {
-		if c.snap.Accounts[i].ID == id {
-			c.snap.Accounts[i].UsedBytes = 0
-			c.snap.Accounts[i].LastResetUnix = now.Unix()
+	// Route the reset through reconcile like SetUsage. reconcile folds the live
+	// (pre-reset) usage into SQLite *before* running the mutation, so MarkReset's
+	// zeroing write is the one that survives into the reload; the rebuild's Apply
+	// then re-seeds the kernel quota's used bytes to 0 from that reloaded
+	// snapshot — no separate nft.ResetQuota call is needed. Doing this under c.mu
+	// with the reconcile's gen++ closes the race where a concurrent persistNow /
+	// reconcile could revive the pre-reset usage (SQLite records the old value
+	// while the kernel quota was already zeroed out-of-band).
+	return c.reconcile(func() error {
+		if err := c.store.MarkReset(id, time.Now()); err != nil {
+			return err
 		}
-	}
-	if c.live.AccountUsed != nil {
-		c.live.AccountUsed[id] = 0
-	}
-	// The kernel quota was just zeroed; discard any sample still in flight so it
-	// cannot write the pre-reset usage back over this reset.
-	c.gen++
-	c.mu.Unlock()
-	return nil
+		// Keep the in-memory live view consistent until the next sample re-reads
+		// the freshly re-seeded kernel quota, so an immediately following
+		// reconcile does not fold the stale value back in.
+		if c.live.AccountUsed != nil {
+			c.live.AccountUsed[id] = 0
+		}
+		return nil
+	})
 }
 
 // runDueResets performs automatic monthly resets for tier-a accounts whose

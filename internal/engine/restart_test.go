@@ -27,7 +27,6 @@ func (m *fakeMgr) Apply(s model.Snapshot) error {
 	return nil
 }
 func (m *fakeMgr) Sample() (nft.Sample, error) { m.sampled++; return m.sample, nil }
-func (m *fakeMgr) ResetQuota(int64) error      { return nil }
 func (m *fakeMgr) TableExists() (bool, error)  { return m.exists, nil }
 func (m *fakeMgr) Teardown() error             { return nil }
 
