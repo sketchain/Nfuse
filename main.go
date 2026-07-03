@@ -1,35 +1,23 @@
 // Command nfuse meters per-port bidirectional traffic on a NIC using nftables
 // netdev hooks, persists usage to SQLite, and enforces per-account quotas with
-// an in-kernel circuit breaker. It runs in one of two roles from the same
-// binary:
+// an in-kernel circuit breaker. The same binary is a subcommand-driven CLI whose
+// first-class citizens are the account/port operations; the interactive TUI is
+// one subcommand among them:
 //
-//	nfuse --rpc                run the server daemon: engine + RPC socket, no TUI.
+//	nfuse server --iface X     run the engine daemon: engine + RPC socket, no TUI.
 //	                           This is the ONLY process that touches nft/SQLite;
 //	                           systemd keeps it running.
-//	nfuse                      run the client: connect to the daemon's socket and
-//	                           render the TUI. Touches neither the kernel nor the
-//	                           DB — every action is an RPC. If the daemon is not
-//	                           running it errors out (no embedded-engine fallback).
-//	nfuse --teardown           remove the kernel ruleset and exit.
+//	nfuse tui                  connect to the daemon's socket and render the TUI.
+//	nfuse list | add | rm | …  drive one daemon RPC each (see `nfuse help`).
+//	nfuse teardown             remove the kernel ruleset and exit.
+//
+// All command wiring lives in internal/cli; main only injects build metadata.
 package main
 
 import (
-	"flag"
-	"fmt"
-	"log"
-	"net"
 	"os"
-	"os/signal"
-	"runtime"
-	"syscall"
-	"time"
 
-	"github.com/sketchain/nfuse/internal/engine"
-	"github.com/sketchain/nfuse/internal/nft"
-	"github.com/sketchain/nfuse/internal/rpc"
-	"github.com/sketchain/nfuse/internal/store"
-	"github.com/sketchain/nfuse/internal/system"
-	"github.com/sketchain/nfuse/internal/tui"
+	"github.com/sketchain/nfuse/internal/cli"
 )
 
 // Build metadata, overridable at link time via
@@ -41,189 +29,5 @@ var (
 )
 
 func main() {
-	var (
-		rpcMode     = flag.Bool("rpc", false, "run as the server daemon (engine + RPC socket, no TUI)")
-		socket      = flag.String("socket", "/run/nfuse.sock", "unix socket path for client/server RPC")
-		iface       = flag.String("iface", "", "network interface to meter (required for --rpc; e.g. ens5)")
-		table       = flag.String("table", "nfuse", "nftables table name")
-		dbPath      = flag.String("db", "/var/lib/nfuse/nfuse.db", "SQLite database path")
-		sampleIvl   = flag.Duration("sample-interval", 2*time.Second, "kernel counter sampling interval")
-		persistIvl  = flag.Duration("persist-interval", 15*time.Second, "SQLite persistence interval")
-		refreshIvl  = flag.Duration("ui-refresh", time.Second, "TUI refresh interval")
-		teardown    = flag.Bool("teardown", false, "remove the nftables ruleset and exit")
-		skipKernChk = flag.Bool("skip-kernel-check", false, "skip the netdev egress kernel version check")
-		showVer     = flag.Bool("version", false, "print version information and exit")
-	)
-	flag.Parse()
-
-	if *showVer {
-		fmt.Printf("nfuse %s (commit %s, built %s, %s)\n", version, commit, date, runtime.Version())
-		return
-	}
-
-	logger := log.New(os.Stderr, "nfuse: ", log.LstdFlags)
-
-	if *teardown {
-		// Teardown touches the kernel directly and is a server-side operation.
-		// Refuse if a daemon is running: it would immediately start erroring on
-		// sampling and rebuild the table from its in-memory snapshot on the next
-		// mutation, leaving kernel and daemon state at odds.
-		if rpc.DaemonAlive(*socket) {
-			logger.Fatalf("nfuse daemon appears to be running on %s; stop it first "+
-				"(systemctl stop nfuse, or kill the --rpc process) before --teardown", *socket)
-		}
-		mgr := nft.New(*table, *iface)
-		if err := mgr.Teardown(); err != nil {
-			logger.Fatalf("teardown: %v", err)
-		}
-		logger.Printf("removed nftables table netdev %s", *table)
-		return
-	}
-
-	if *rpcMode {
-		if err := validateIface(*iface); err != nil {
-			logger.Fatalf("%v", err)
-		}
-		runServer(logger, serverOpts{
-			socket: *socket, iface: *iface, table: *table, dbPath: *dbPath,
-			sampleIvl: *sampleIvl, persistIvl: *persistIvl, skipKernChk: *skipKernChk,
-		})
-		return
-	}
-
-	runClient(logger, *socket, *refreshIvl)
-}
-
-type serverOpts struct {
-	socket, iface, table, dbPath string
-	sampleIvl, persistIvl        time.Duration
-	skipKernChk                  bool
-}
-
-// validateIface rejects an empty or non-existent interface for the daemon role.
-// The daemon must meter a real NIC: an empty name would silently build no useful
-// rules, and a name that does not exist would fail later inside `nft -f` with an
-// obscure device error. Failing fast here is the expected behavior under systemd
-// Restart=on-failure while the NIC is still coming up.
-func validateIface(iface string) error {
-	if iface == "" {
-		return fmt.Errorf("--rpc requires --iface <interface>; pick one from `ip -br link` (e.g. --iface ens5)")
-	}
-	if _, err := net.InterfaceByName(iface); err != nil {
-		return fmt.Errorf("interface %q not found on this host; pick one from `ip -br link`: %v", iface, err)
-	}
-	return nil
-}
-
-// singleInstanceGuard refuses to start a second daemon on the same socket. It is
-// called at the very top of runServer, before any resource (nft table, SQLite
-// DB, engine) is touched, so a duplicate daemon is rejected before it can mutate
-// the shared kernel/DB state. rpc.Server.Listen performs the same probe again as
-// a backstop once it is about to bind.
-func singleInstanceGuard(socket string) error {
-	if rpc.DaemonAlive(socket) {
-		return fmt.Errorf("another nfuse daemon is already listening on %s; stop it first", socket)
-	}
-	return nil
-}
-
-// runServer is the daemon role: it owns nft and SQLite, runs the engine, and
-// serves RPCs. It is what systemd keeps running.
-func runServer(logger *log.Logger, o serverOpts) {
-	// Single-instance guard first, before touching any shared resource: a second
-	// daemon must be rejected before engine.New rebuilds the kernel table or the
-	// store opens the shared DB.
-	if err := singleInstanceGuard(o.socket); err != nil {
-		logger.Fatalf("%v", err)
-	}
-
-	kernelOK := true
-	var kernelRaw string
-	if _, _, raw, err := system.KernelVersion(); err == nil {
-		kernelRaw = raw
-	}
-	if !o.skipKernChk {
-		if err := system.CheckNetdevEgress(); err != nil {
-			logger.Fatalf("preflight: %v", err)
-		}
-	} else {
-		// We skipped enforcement, so we can't assert the kernel is adequate.
-		kernelOK = false
-	}
-
-	mgr := nft.New(o.table, o.iface)
-
-	if err := ensureDBDir(o.dbPath); err != nil {
-		logger.Fatalf("db dir: %v", err)
-	}
-	st, err := store.Open(o.dbPath)
-	if err != nil {
-		logger.Fatalf("open db: %v", err)
-	}
-	defer st.Close()
-
-	ctrl, err := engine.New(st, mgr, engine.Options{
-		SampleInterval:  o.sampleIvl,
-		PersistInterval: o.persistIvl,
-		Logf:            logger.Printf,
-	})
-	if err != nil {
-		logger.Fatalf("engine: %v", err)
-	}
-	ctrl.Start()
-	defer ctrl.Stop()
-
-	srv := rpc.NewServer(ctrl, o.iface, kernelOK, kernelRaw, logger.Printf)
-	if err := srv.Listen(o.socket); err != nil {
-		logger.Fatalf("rpc listen: %v", err)
-	}
-	defer srv.Close()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve() }()
-	logger.Printf("nfuse daemon listening on %s (iface %s); press Ctrl-C to stop", o.socket, o.iface)
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case <-sig:
-		logger.Printf("shutting down")
-	case err := <-errCh:
-		if err != nil {
-			logger.Printf("rpc serve: %v", err)
-		}
-	}
-}
-
-// runClient is the TUI role: it connects to the daemon and renders the UI.
-// Without a reachable daemon it exits with an error — the client never runs an
-// embedded engine.
-func runClient(logger *log.Logger, socket string, refresh time.Duration) {
-	client, err := rpc.Dial(socket)
-	if err != nil {
-		logger.Fatalf("cannot connect to nfuse daemon at %s: %v\nStart the service first: nfuse --rpc", socket, err)
-	}
-	defer client.Close()
-
-	ui := tui.New(client, refresh)
-	if err := ui.Run(); err != nil {
-		logger.Printf("tui: %v", err)
-	}
-}
-
-func ensureDBDir(path string) error {
-	dir := path
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			dir = path[:i]
-			break
-		}
-	}
-	if dir == "" || dir == path {
-		return nil
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
-	}
-	return nil
+	os.Exit(cli.Main(cli.BuildInfo{Version: version, Commit: commit, Date: date}, os.Args[1:]))
 }

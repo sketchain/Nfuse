@@ -3,25 +3,55 @@
 Nfuse meters **per-port, bidirectional** traffic on a NIC using nftables
 **netdev** hooks, persists usage to **SQLite**, and enforces per-account quotas
 with an **in-kernel circuit breaker** (nftables named `quota` → per-packet
-`drop`). A **TUI** manages accounts, ports, tiers and resets.
+`drop`). A **subcommand CLI** manages accounts, ports, tiers and resets — with
+an interactive **TUI** available as `nfuse tui`.
 
 The metering fast path and the breaker are entirely in the kernel; user space
 only samples, persists, resets and reconciles — so if the Go process dies, the
 breaker still holds.
 
-## Server / client roles
+## Command structure
+
+`nfuse` is a subcommand-driven CLI. The **operational** commands are the
+first-class citizens: each is a thin RPC client that drives one daemon method
+over the socket. The **lifecycle** commands own the process role.
+
+```
+nfuse server   --iface X   run the engine daemon (owns nft + SQLite)
+nfuse tui                  interactive terminal UI against a running daemon
+nfuse teardown             remove the kernel ruleset and exit
+nfuse version              print version information
+
+nfuse list [--json]                account/port/usage listing
+nfuse add <name> --tier a|b|c …     add an account
+nfuse rm <account> [--cascade]      delete an account
+nfuse set-tier <account> --tier …   change tier / limit
+nfuse reset <account>               zero an account's usage
+nfuse set-usage <account> <bytes>   set an account's usage
+nfuse persist                       force a SQLite snapshot now
+nfuse port add  <account> <start[-end]>
+nfuse port edit <port-id> <start[-end]>
+nfuse port rm   <port-id>
+nfuse port move <port-id> <account>
+```
+
+A bare `nfuse` (no subcommand) prints usage and exits non-zero; it no longer
+launches the TUI — run `nfuse tui` for that.
+
+### Server / client roles
 
 The same binary runs in one of two roles:
 
-- **`nfuse --rpc`** — the **server daemon**. It runs the engine and listens on a
-  Unix domain socket. It is the **only** process that touches nftables and
+- **`nfuse server`** — the **server daemon**. It runs the engine and listens on
+  a Unix domain socket. It is the **only** process that touches nftables and
   SQLite (sampling, persistence, monthly resets, and every mutation go through
   its single reconcile path), so there is no write contention. This is the role
   systemd keeps running.
-- **`nfuse`** (default) — the **client / TUI**. It only connects to the socket,
-  renders the UI, and sends each user action as an RPC. It touches neither the
-  kernel nor the DB. If the daemon is not reachable it exits with an error
-  telling you to start the service — there is **no embedded-engine fallback**.
+- **the client commands** (`nfuse tui`, `nfuse list`, `nfuse add`, …) — they
+  only connect to the socket and send each action as an RPC. They touch neither
+  the kernel nor the DB. If the daemon is not reachable they exit non-zero with
+  an error telling you to start the service — there is **no embedded-engine
+  fallback**.
 
 The transport is newline-delimited JSON over the socket. Mutating RPCs return
 only `ok`/`err`; after a success the client re-reads full state via `GetState`.
@@ -168,12 +198,13 @@ mutation and sampling runs at human timescales.
 ## Layout
 
 ```
-main.go                 flags, role split (server daemon vs TUI client), signals
+main.go                 thin shim: inject build metadata, hand off to internal/cli
+internal/cli            subcommand dispatch, operational commands, --json output
 internal/model          domain types + invariants (account→port→counter tree)
 internal/store          SQLite (WAL) load/save + reboot backfill
 internal/nft            nftables manager: script generation + JSON sampling
 internal/engine         sampling loop, non-blocking persistence, resets, reconcile
-internal/rpc            Unix-socket JSON RPC: server (engine) + client (TUI)
+internal/rpc            Unix-socket JSON RPC: server (engine) + client (consumers)
 internal/system         kernel-version preflight (netdev egress ≥ 5.16)
 internal/tui            tview UI (drives a local engine or the RPC client)
 ```
@@ -184,24 +215,55 @@ internal/tui            tview UI (drives a local engine or the RPC client)
 go build -o nfuse .
 
 # Server daemon (owns nft + SQLite, no TUI) — the systemd-managed role:
-sudo ./nfuse --rpc --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfuse.sock
+sudo ./nfuse server --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfuse.sock
 
-# Client TUI (connects to the daemon's socket; errors out if it can't):
-sudo ./nfuse --socket /run/nfuse.sock
+# Manage accounts and ports from the shell (each is one RPC to the daemon):
+sudo ./nfuse add web --tier a --limit 100 --anchor 1   # 100 GiB/month, resets on the 1st
+sudo ./nfuse port add web 60000-60099                  # meter a port range
+sudo ./nfuse list                                      # human-readable listing
+sudo ./nfuse list --json | jq '.[] | {name, used_bytes}'
 
-sudo ./nfuse --teardown                                  # remove the ruleset
+# Interactive TUI (connects to the daemon's socket; errors out if it can't):
+sudo ./nfuse tui --socket /run/nfuse.sock
+
+sudo ./nfuse teardown                                  # remove the ruleset
 ```
 
-`--teardown` refuses to run while a daemon is live on the socket (it would fight
+`teardown` refuses to run while a daemon is live on the socket (it would fight
 the running engine, which rebuilds the table on its next mutation). Stop the
-service first (`systemctl stop nfuse`, or kill the `--rpc` process).
+service first (`systemctl stop nfuse`, or kill the `nfuse server` process).
 
 The daemon requires root (nftables) and Linux ≥ 5.16. `--iface` is **required
-for `--rpc`** (there is no default): the daemon refuses to start if it is empty
-or names an interface that doesn't exist on the host — pick one from
-`ip -br link`. `--teardown` and the TUI client don't need it. Flags: `--rpc`,
+for `nfuse server`** (there is no default): the daemon refuses to start if it is
+empty or names an interface that doesn't exist on the host — pick one from
+`ip -br link`. `teardown` and the client commands don't need it. Server flags:
 `--socket`, `--iface`, `--table`, `--db`, `--sample-interval`,
-`--persist-interval`, `--ui-refresh`, `--teardown`, `--skip-kernel-check`.
+`--persist-interval`, `--skip-kernel-check`. `nfuse tui` takes `--socket` and
+`--ui-refresh`. Every operational command shares `--socket`.
+
+### Scripting with `--json`
+
+`nfuse list --json` writes a stable JSON array to **stdout** (logs and errors go
+to **stderr**, never mixed in), so it drops straight into `jq`, billing jobs or
+other automation. Usage is reported as **raw bytes** (`used_bytes`), and every
+port carries its numeric **id** — the handle `port edit`, `port rm` and
+`port move` take. An empty account list is `[]`, not `null`. Exit code is `0` on
+success and non-zero on failure so scripts can branch on it.
+
+```json
+[
+  {
+    "id": 1, "name": "web", "tier": "a",
+    "limit_gib": 100, "limit_bytes": 107374182400, "used_bytes": 5368709120,
+    "ports": [ { "id": 7, "start": 60000, "end": 60099 } ]
+  }
+]
+```
+
+Account-referencing commands accept a **name or a numeric id**: the name is
+resolved first against the live account list, and an ambiguous name (or a
+missing account) is an error rather than a guess. `port` commands take the
+numeric port id shown by `nfuse list`.
 
 ### Running under systemd
 
@@ -213,7 +275,7 @@ Wants=network-online.target
 
 [Service]
 # --iface is required; substitute your NIC (see `ip -br link`).
-ExecStart=/usr/local/bin/nfuse --rpc --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfuse.sock
+ExecStart=/usr/local/bin/nfuse server --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfuse.sock
 Restart=on-failure
 
 [Install]
