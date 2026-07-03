@@ -19,7 +19,6 @@ func (fakeNft) Apply(model.Snapshot) error { return nil }
 func (fakeNft) Sample() (nft.Sample, error) {
 	return nft.Sample{Counters: map[model.CounterKey]model.Counter{}, AccountUsed: map[int64]uint64{}}, nil
 }
-func (fakeNft) ResetQuota(int64) error     { return nil }
 func (fakeNft) TableExists() (bool, error) { return false, nil }
 func (fakeNft) Teardown() error            { return nil }
 

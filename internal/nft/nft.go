@@ -70,8 +70,6 @@ type Manager interface {
 	Apply(snap model.Snapshot) error
 	// Sample reads live counter and quota-used values from the kernel.
 	Sample() (Sample, error)
-	// ResetQuota zeroes one account's named quota in the kernel.
-	ResetQuota(accountID int64) error
 	// TableExists reports whether the managed netdev table is currently present
 	// in the kernel. It distinguishes a cold start (table absent, machine
 	// rebooted) from a hot restart (table still live with fresher-than-SQLite
@@ -209,18 +207,6 @@ func (m *execManager) runScript(script string) error {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("nft -f failed: %v: %s\n--- script ---\n%s", err, strings.TrimSpace(stderr.String()), script)
-	}
-	return nil
-}
-
-func (m *execManager) ResetQuota(accountID int64) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := nftCommand(ctx, "reset", "quota", "netdev", m.table, quotaName(accountID))
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("reset quota %s: %v: %s", quotaName(accountID), err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
 }
