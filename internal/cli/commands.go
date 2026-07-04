@@ -43,6 +43,23 @@ func arg(pos []string, i int) string {
 	return ""
 }
 
+// exactArgs verifies pos carries exactly n positional arguments. On mismatch it
+// prints usage to stderr — distinguishing "too few" (show the command's own
+// usage string) from "too many" (extra tokens the flag parser would otherwise
+// drop silently) — and returns false so the caller exits 2. Every operational
+// subcommand has a fixed arity, so this is the single gate for both cases.
+func (a *App) exactArgs(pos []string, n int, usage string) bool {
+	switch {
+	case len(pos) < n:
+		fmt.Fprintf(a.Stderr, "nfuse: %s\n", usage)
+	case len(pos) > n:
+		fmt.Fprintf(a.Stderr, "nfuse: too many arguments (want %d, got %d); %s\n", n, len(pos), usage)
+	default:
+		return true
+	}
+	return false
+}
+
 // withClient dials the daemon and runs fn, translating a dial failure into a
 // non-zero exit code with a message on stderr. It centralizes the connect /
 // close / error-reporting boilerplate shared by every operational command.
@@ -66,7 +83,11 @@ func (a *App) cmdList(args []string) int {
 	fs := a.newFlagSet("list")
 	socket := socketFlag(fs)
 	asJSON := fs.Bool("json", false, "emit machine-readable JSON on stdout")
-	if _, err := parseArgs(fs, args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if !a.exactArgs(pos, 0, "list takes no positional arguments: nfuse list [--json]") {
 		return 2
 	}
 	return a.withClient(*socket, func(c opClient) error {
@@ -100,11 +121,10 @@ func (a *App) cmdAdd(args []string) int {
 	if err != nil {
 		return 2
 	}
-	name := arg(pos, 0)
-	if name == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: add requires an account name: nfuse add <name> --tier a|b|c")
+	if !a.exactArgs(pos, 1, "add requires an account name: nfuse add <name> --tier a|b|c") {
 		return 2
 	}
+	name := arg(pos, 0)
 	tier, err := parseTier(*tierStr)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
@@ -117,6 +137,11 @@ func (a *App) cmdAdd(args []string) int {
 	return a.withClient(*socket, func(c opClient) error {
 		id, err := c.AddAccount(name, tier, *limit, *anchor)
 		if err != nil {
+			// The account name is UNIQUE in the store; surface the raw SQLite
+			// constraint failure as a plain "already exists" message.
+			if strings.Contains(err.Error(), "UNIQUE constraint") {
+				return fmt.Errorf("an account named %q already exists", name)
+			}
 			return err
 		}
 		fmt.Fprintf(a.Stdout, "added account %q (id %d)\n", name, id)
@@ -134,17 +159,21 @@ func (a *App) cmdRm(args []string) int {
 	if err != nil {
 		return 2
 	}
-	ref := arg(pos, 0)
-	if ref == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: rm requires an account name or id: nfuse rm <account>")
+	if !a.exactArgs(pos, 1, "rm requires an account name or id: nfuse rm <account>") {
 		return 2
 	}
+	ref := arg(pos, 0)
 	return a.withClient(*socket, func(c opClient) error {
 		id, err := resolveAccount(c, ref)
 		if err != nil {
 			return err
 		}
 		if err := c.DeleteAccount(id, *cascade); err != nil {
+			// The daemon refuses to delete an account that still owns ports unless
+			// cascade is set; point the operator at the flag it's missing.
+			if !*cascade && strings.Contains(err.Error(), "still owns") {
+				return fmt.Errorf("%v (pass --cascade to delete the account together with its ports)", err)
+			}
 			return err
 		}
 		fmt.Fprintf(a.Stdout, "deleted account %d\n", id)
@@ -164,11 +193,10 @@ func (a *App) cmdSetTier(args []string) int {
 	if err != nil {
 		return 2
 	}
-	ref := arg(pos, 0)
-	if ref == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: set-tier requires an account: nfuse set-tier <account> --tier a|b|c")
+	if !a.exactArgs(pos, 1, "set-tier requires an account: nfuse set-tier <account> --tier a|b|c") {
 		return 2
 	}
+	ref := arg(pos, 0)
 	tier, err := parseTier(*tierStr)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
@@ -200,11 +228,10 @@ func (a *App) cmdReset(args []string) int {
 	if err != nil {
 		return 2
 	}
-	ref := arg(pos, 0)
-	if ref == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: reset requires an account: nfuse reset <account>")
+	if !a.exactArgs(pos, 1, "reset requires an account: nfuse reset <account>") {
 		return 2
 	}
+	ref := arg(pos, 0)
 	return a.withClient(*socket, func(c opClient) error {
 		id, err := resolveAccount(c, ref)
 		if err != nil {
@@ -227,11 +254,10 @@ func (a *App) cmdSetUsage(args []string) int {
 	if err != nil {
 		return 2
 	}
-	ref, bytesArg := arg(pos, 0), arg(pos, 1)
-	if ref == "" || bytesArg == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: set-usage requires an account and a byte count: nfuse set-usage <account> <bytes>")
+	if !a.exactArgs(pos, 2, "set-usage requires an account and a byte count: nfuse set-usage <account> <bytes>") {
 		return 2
 	}
+	ref, bytesArg := arg(pos, 0), arg(pos, 1)
 	usedBytes, err := strconv.ParseUint(bytesArg, 10, 64)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "nfuse: invalid byte count %q: want a non-negative integer\n", bytesArg)
@@ -255,7 +281,11 @@ func (a *App) cmdSetUsage(args []string) int {
 func (a *App) cmdPersist(args []string) int {
 	fs := a.newFlagSet("persist")
 	socket := socketFlag(fs)
-	if _, err := parseArgs(fs, args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if !a.exactArgs(pos, 0, "persist takes no positional arguments: nfuse persist") {
 		return 2
 	}
 	return a.withClient(*socket, func(c opClient) error {
@@ -297,11 +327,10 @@ func (a *App) cmdPortAdd(args []string) int {
 	if err != nil {
 		return 2
 	}
-	ref, spec := arg(pos, 0), arg(pos, 1)
-	if ref == "" || spec == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: port add requires an account and a port: nfuse port add <account> <start[-end]>")
+	if !a.exactArgs(pos, 2, "port add requires an account and a port: nfuse port add <account> <start[-end]>") {
 		return 2
 	}
+	ref, spec := arg(pos, 0), arg(pos, 1)
 	start, end, err := parsePortSpec(spec)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
@@ -327,11 +356,10 @@ func (a *App) cmdPortEdit(args []string) int {
 	if err != nil {
 		return 2
 	}
-	idArg, spec := arg(pos, 0), arg(pos, 1)
-	if idArg == "" || spec == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: port edit requires a port id and a port: nfuse port edit <port-id> <start[-end]>")
+	if !a.exactArgs(pos, 2, "port edit requires a port id and a port: nfuse port edit <port-id> <start[-end]>") {
 		return 2
 	}
+	idArg, spec := arg(pos, 0), arg(pos, 1)
 	portID, err := parsePortID(idArg)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
@@ -358,11 +386,10 @@ func (a *App) cmdPortRm(args []string) int {
 	if err != nil {
 		return 2
 	}
-	idArg := arg(pos, 0)
-	if idArg == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: port rm requires a port id: nfuse port rm <port-id>")
+	if !a.exactArgs(pos, 1, "port rm requires a port id: nfuse port rm <port-id>") {
 		return 2
 	}
+	idArg := arg(pos, 0)
 	portID, err := parsePortID(idArg)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
@@ -384,11 +411,10 @@ func (a *App) cmdPortMove(args []string) int {
 	if err != nil {
 		return 2
 	}
-	idArg, ref := arg(pos, 0), arg(pos, 1)
-	if idArg == "" || ref == "" {
-		fmt.Fprintln(a.Stderr, "nfuse: port move requires a port id and a target account: nfuse port move <port-id> <account>")
+	if !a.exactArgs(pos, 2, "port move requires a port id and a target account: nfuse port move <port-id> <account>") {
 		return 2
 	}
+	idArg, ref := arg(pos, 0), arg(pos, 1)
 	portID, err := parsePortID(idArg)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)

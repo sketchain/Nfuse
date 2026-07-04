@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 
@@ -320,6 +321,50 @@ func TestRmUnknownAccountExitsNonZero(t *testing.T) {
 	}
 }
 
+// ── error-message wrapping ───────────────────────────────────────────────────
+
+// TestAddDuplicateNameWrapped: the raw SQLite UNIQUE constraint failure is
+// rewritten into a plain "already exists" message at the CLI boundary.
+func TestAddDuplicateNameWrapped(t *testing.T) {
+	fc := &fakeClient{mutErr: fmt.Errorf("constraint failed: UNIQUE constraint failed: accounts.name (2067)")}
+	app, _, errb := newTestApp(fc)
+	if code := app.Run([]string{"add", "alice", "--tier", "c"}); code != 1 {
+		t.Fatalf("duplicate add exit = %d, want 1", code)
+	}
+	if !strings.Contains(errb.String(), `account named "alice" already exists`) {
+		t.Errorf("expected friendly duplicate message, got %q", errb.String())
+	}
+	if strings.Contains(errb.String(), "UNIQUE") {
+		t.Errorf("raw SQLite error should not leak to the user, got %q", errb.String())
+	}
+}
+
+// TestRmPortsOwnedHintsCascade: rm of an account that still owns ports appends a
+// --cascade hint to the daemon's refusal.
+func TestRmPortsOwnedHintsCascade(t *testing.T) {
+	fc := &fakeClient{accounts: sampleAccounts(), mutErr: fmt.Errorf("account still owns 2 port(s); remove them first")}
+	app, _, errb := newTestApp(fc)
+	if code := app.Run([]string{"rm", "alice"}); code != 1 {
+		t.Fatalf("rm with ports exit = %d, want 1", code)
+	}
+	if !strings.Contains(errb.String(), "--cascade") {
+		t.Errorf("expected a --cascade hint, got %q", errb.String())
+	}
+}
+
+// TestRmCascadeSuppressesHint: with --cascade already set, no hint is appended
+// (the error, if any, passes through unchanged).
+func TestRmCascadeSuppressesHint(t *testing.T) {
+	fc := &fakeClient{accounts: sampleAccounts(), mutErr: fmt.Errorf("account still owns 2 port(s); remove them first")}
+	app, _, errb := newTestApp(fc)
+	if code := app.Run([]string{"rm", "alice", "--cascade"}); code != 1 {
+		t.Fatalf("rm --cascade exit = %d, want 1", code)
+	}
+	if strings.Contains(errb.String(), "pass --cascade") {
+		t.Errorf("should not hint --cascade when it is already set, got %q", errb.String())
+	}
+}
+
 // ── required-argument error paths ────────────────────────────────────────────
 
 func TestAddMissingTier(t *testing.T) {
@@ -405,6 +450,49 @@ func TestPortAddBadSpec(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "invalid port") {
 		t.Errorf("expected invalid port, got %q", errb.String())
+	}
+}
+
+// ── surplus positional arguments ─────────────────────────────────────────────
+
+// TestExtraPositionalArgsRejected covers every operational subcommand: a token
+// beyond its fixed arity must be an error (exit 2) rather than silently dropped,
+// and the daemon must not be touched. `otherwise good` args are chosen so the
+// only fault is the trailing extra token.
+func TestExtraPositionalArgsRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"list", []string{"list", "bogus"}},
+		{"list --json", []string{"list", "--json", "bogus"}},
+		{"persist", []string{"persist", "bogus"}},
+		{"add", []string{"add", "carol", "--tier", "c", "bogus"}},
+		{"rm", []string{"rm", "alice", "bogus"}},
+		{"set-tier", []string{"set-tier", "alice", "--tier", "c", "bogus"}},
+		{"reset", []string{"reset", "alice", "bogus"}},
+		{"set-usage", []string{"set-usage", "alice", "100", "bogus"}},
+		{"port add", []string{"port", "add", "alice", "9000", "bogus"}},
+		{"port edit", []string{"port", "edit", "11", "9000", "bogus"}},
+		{"port rm", []string{"port", "rm", "11", "bogus"}},
+		{"port move", []string{"port", "move", "11", "bob", "bogus"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &fakeClient{accounts: sampleAccounts()}
+			app, _, errb := newTestApp(fc)
+			if code := app.Run(tc.args); code != 2 {
+				t.Fatalf("%s with extra arg exit = %d, want 2", tc.name, code)
+			}
+			if !strings.Contains(errb.String(), "too many arguments") {
+				t.Errorf("%s: expected too-many-arguments error, got %q", tc.name, errb.String())
+			}
+			if fc.added != nil || fc.deleted != nil || fc.setTiers != nil ||
+				fc.addedPorts != nil || fc.editPorts != nil || fc.delPorts != nil ||
+				fc.movePorts != nil || fc.resets != nil || fc.setUsages != nil || fc.persisted != 0 {
+				t.Errorf("%s: a surplus-argument command must not reach the daemon", tc.name)
+			}
+		})
 	}
 }
 
@@ -512,5 +600,11 @@ func TestValidateIface(t *testing.T) {
 	}
 	if err := validateIface("definitely-not-a-real-nic0"); err == nil {
 		t.Error("non-existent --iface must be rejected")
+	}
+	// Loopback is always present: the daemon role must accept a real interface.
+	if _, err := net.InterfaceByName("lo"); err == nil {
+		if err := validateIface("lo"); err != nil {
+			t.Errorf("validateIface(lo) = %v, want nil", err)
+		}
 	}
 }
