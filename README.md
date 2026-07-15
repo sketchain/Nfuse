@@ -243,8 +243,9 @@ for `nfuse server`** (there is no default): the daemon refuses to start if it is
 empty or names an interface that doesn't exist on the host — pick one from
 `ip -br link`. `teardown` and the client commands don't need it. Server flags:
 `--socket`, `--iface`, `--table`, `--db`, `--sample-interval`,
-`--persist-interval`, `--skip-kernel-check`, `--http-addr` (HTTP query endpoint;
-default `127.0.0.1:8787`, empty disables it). `nfuse tui` takes `--socket` and
+`--persist-interval`, `--skip-kernel-check`, `--http-addr` / `--http-port`
+(HTTP query endpoint; **off by default** — set `--http-port` to enable it, bound
+to `--http-addr`, default `127.0.0.1`). `nfuse tui` takes `--socket` and
 `--ui-refresh`. Every operational command shares `--socket`.
 
 ### Scripting with `--json`
@@ -273,16 +274,17 @@ numeric port id shown by `nfuse list`.
 
 ### HTTP query (`curl <host:port>/<token>`)
 
-The **server daemon** also exposes a small **read-only HTTP query endpoint** so an
-operator or billing script can read usage with plain `curl` — no socket, no client
-binary. It is started **only by `nfuse server`** (never by `nfuse tui` or the
-operational commands) and binds **127.0.0.1:8787** by default, so it is local-only
-until you deliberately open it:
+The **server daemon** can also expose a small **read-only HTTP query endpoint** so
+an operator or billing script can read usage with plain `curl` — no socket, no
+client binary. It is started **only by `nfuse server`** (never by `nfuse tui` or
+the operational commands) and is **off by default**: it starts only when you set
+`--http-port`. The bind address is `--http-addr` (default `127.0.0.1`), so even
+once enabled it stays local-only until you deliberately open it:
 
 ```sh
-# default: loopback only. Override to expose it (and firewall it yourself):
-sudo ./nfuse server --iface ens5 --http-addr 0.0.0.0:8787   # listen on all NICs
-sudo ./nfuse server --iface ens5 --http-addr ''             # disable the endpoint
+sudo ./nfuse server --iface ens5 --http-port 8787                     # enable, loopback only
+sudo ./nfuse server --iface ens5 --http-port 8787 --http-addr 0.0.0.0 # enable on all NICs
+sudo ./nfuse server --iface ens5                                      # endpoint off (default)
 ```
 
 Access is by **token in the URL path**. Every account has its own token, and there

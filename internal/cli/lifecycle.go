@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -22,14 +23,20 @@ import (
 type serverOpts struct {
 	socket, iface, table, dbPath string
 	httpAddr                     string
+	httpPort                     int
 	sampleIvl, persistIvl        time.Duration
 	skipKernChk                  bool
 }
 
-// DefaultHTTPAddr is where the HTTP query endpoint binds unless overridden with
-// --http-addr. It defaults to loopback so the endpoint is local-only until the
-// operator deliberately opens it (e.g. --http-addr 0.0.0.0:8787).
-const DefaultHTTPAddr = "127.0.0.1:8787"
+// DefaultHTTPAddr is the bind address the HTTP query endpoint uses when it is
+// enabled. It defaults to loopback so the endpoint stays local-only unless the
+// operator deliberately opens it (e.g. --http-addr 0.0.0.0).
+const DefaultHTTPAddr = "127.0.0.1"
+
+// DefaultHTTPPort is the default value of --http-port. It is 0, which means the
+// HTTP query endpoint is disabled unless the operator sets a real port; the
+// endpoint is opt-in, never started by default.
+const DefaultHTTPPort = 0
 
 // runServer is the daemon role (formerly `nfuse --rpc`): it owns nft and SQLite,
 // runs the engine, and serves RPCs. It is what systemd keeps running. The
@@ -45,7 +52,8 @@ func (a *App) runServer(args []string) int {
 		sampleIvl   = fs.Duration("sample-interval", 2*time.Second, "kernel counter sampling interval")
 		persistIvl  = fs.Duration("persist-interval", 15*time.Second, "SQLite persistence interval")
 		skipKernChk = fs.Bool("skip-kernel-check", false, "skip the netdev egress kernel version check")
-		httpAddr    = fs.String("http-addr", DefaultHTTPAddr, "HTTP query endpoint address (empty disables it)")
+		httpAddr    = fs.String("http-addr", DefaultHTTPAddr, "HTTP query endpoint bind address (used only when --http-port is set)")
+		httpPort    = fs.Int("http-port", DefaultHTTPPort, "HTTP query endpoint port (0 disables the endpoint; the endpoint is off by default)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -57,7 +65,8 @@ func (a *App) runServer(args []string) int {
 		return 1
 	}
 	return runServerDaemon(logger, serverOpts{
-		socket: *socket, iface: *iface, table: *table, dbPath: *dbPath, httpAddr: *httpAddr,
+		socket: *socket, iface: *iface, table: *table, dbPath: *dbPath,
+		httpAddr: *httpAddr, httpPort: *httpPort,
 		sampleIvl: *sampleIvl, persistIvl: *persistIvl, skipKernChk: *skipKernChk,
 	})
 }
@@ -207,13 +216,16 @@ func runServerDaemon(logger *log.Logger, o serverOpts) int {
 	}
 	defer srv.Close()
 
-	// HTTP query endpoint: only the server role starts it, and only when an
-	// address is configured (--http-addr ""). Bind failures are fatal here — same
-	// as the RPC socket — so a misconfigured address is caught at startup.
+	// HTTP query endpoint: opt-in and server-role only. It starts solely when a
+	// port is configured (--http-port > 0); it is off by default. Bind failures
+	// are fatal here — same as the RPC socket — so a misconfigured address/port is
+	// caught at startup rather than silently swallowed on a background goroutine.
 	var httpSrv *httpapi.Server
-	if o.httpAddr != "" {
+	var httpAddr string
+	if o.httpPort != 0 {
+		httpAddr = net.JoinHostPort(o.httpAddr, strconv.Itoa(o.httpPort))
 		httpSrv = httpapi.New(ctrl, logger.Printf)
-		if err := httpSrv.Listen(o.httpAddr); err != nil {
+		if err := httpSrv.Listen(httpAddr); err != nil {
 			logger.Printf("http listen: %v", err)
 			return 1
 		}
@@ -228,7 +240,7 @@ func runServerDaemon(logger *log.Logger, o serverOpts) int {
 				logger.Printf("http serve: %v", err)
 			}
 		}()
-		logger.Printf("nfuse http query endpoint listening on %s", o.httpAddr)
+		logger.Printf("nfuse http query endpoint listening on %s", httpAddr)
 	}
 	logger.Printf("nfuse daemon listening on %s (iface %s); press Ctrl-C to stop", o.socket, o.iface)
 
