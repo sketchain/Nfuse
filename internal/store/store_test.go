@@ -116,6 +116,106 @@ func TestMigrateBackfillsEndColumn(t *testing.T) {
 	}
 }
 
+// TestMigrateBackfillsTokens covers the token-migration path: a legacy database
+// with no `token` column and no master token gets, on first Open, a unique token
+// on every account and a distinct master token — without disturbing existing
+// data — and the whole step is idempotent on reopen.
+func TestMigrateBackfillsTokens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	createLegacyDB(t, path) // one account (id 1), no token column, no meta table
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open (migrate): %v", err)
+	}
+
+	snap, err := st.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(snap.Accounts) != 1 {
+		t.Fatalf("got %d accounts, want 1", len(snap.Accounts))
+	}
+	tok := snap.Accounts[0].Token
+	if len(tok) != model.TokenLength {
+		t.Fatalf("account token %q length = %d, want %d", tok, len(tok), model.TokenLength)
+	}
+	for _, r := range tok {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			t.Fatalf("account token %q has non-letter %q", tok, r)
+		}
+	}
+	// Existing data must be untouched by the token backfill.
+	if snap.Accounts[0].Name != "legacy" || snap.Accounts[0].ID != 1 {
+		t.Fatalf("token migration disturbed account data: %+v", snap.Accounts[0])
+	}
+
+	master, err := st.MasterToken()
+	if err != nil {
+		t.Fatalf("master token: %v", err)
+	}
+	if len(master) != model.TokenLength {
+		t.Fatalf("master token %q length = %d, want %d", master, len(master), model.TokenLength)
+	}
+	if master == tok {
+		t.Fatalf("master token must differ from the account token, both %q", master)
+	}
+	st.Close()
+
+	// Reopen: migration is a no-op, tokens unchanged.
+	st2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	snap2, err := st2.Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if snap2.Accounts[0].Token != tok {
+		t.Fatalf("token changed on reopen: %q -> %q", tok, snap2.Accounts[0].Token)
+	}
+	master2, err := st2.MasterToken()
+	if err != nil {
+		t.Fatalf("master token reopen: %v", err)
+	}
+	if master2 != master {
+		t.Fatalf("master token changed on reopen: %q -> %q", master, master2)
+	}
+}
+
+// TestFreshDBGeneratesMasterToken: a brand-new database already has a master
+// token after Open, and a created account gets whatever token the caller stored.
+func TestFreshDBGeneratesMasterToken(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatalf("open fresh: %v", err)
+	}
+	defer st.Close()
+	master, err := st.MasterToken()
+	if err != nil {
+		t.Fatalf("master token: %v", err)
+	}
+	if len(master) != model.TokenLength {
+		t.Fatalf("fresh master token %q length = %d, want %d", master, len(master), model.TokenLength)
+	}
+	// SetToken round-trips through Load.
+	id, err := st.CreateAccount(model.Account{Name: "a", Tier: model.TierUnlimited, Token: "AAAAAAAAAAAAAAAA"})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if err := st.SetToken(id, "BBBBBBBBBBBBBBBB"); err != nil {
+		t.Fatalf("set token: %v", err)
+	}
+	snap, err := st.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if snap.Accounts[0].Token != "BBBBBBBBBBBBBBBB" {
+		t.Fatalf("token round-trip = %q, want the value set", snap.Accounts[0].Token)
+	}
+}
+
 // TestFreshDBHasEndColumn covers the fresh-schema path: a brand-new database
 // created by Open already stores ranges without any migration step.
 func TestFreshDBHasEndColumn(t *testing.T) {

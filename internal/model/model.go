@@ -8,6 +8,7 @@
 package model
 
 import (
+	"crypto/rand"
 	"fmt"
 	"strconv"
 	"strings"
@@ -93,6 +94,13 @@ type Account struct {
 	BillingAnchorDay int
 	UsedBytes        uint64 // persisted quota "used" snapshot
 	LastResetUnix    int64  // unix seconds of last monthly reset
+	// Token is the account's per-user HTTP query token: 16 mixed-case ASCII
+	// letters, unique across accounts (and distinct from the master token).
+	// It grants read-only access to this account's usage over the HTTP query
+	// endpoint. Legacy databases created before tokens existed backfill one on
+	// first load (see store.ensureTokens), so this is empty only transiently
+	// during that migration, never in a loaded, live snapshot.
+	Token string
 }
 
 // LimitBytes returns the quota ceiling in bytes (0 for unlimited tiers).
@@ -236,6 +244,39 @@ func FormatBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// TokenLength is the fixed character length of every query token (account and
+// master). Tokens are not user-customizable; they are always regenerated whole.
+const TokenLength = 16
+
+// tokenAlphabet is the 52-symbol mixed-case ASCII letter set query tokens are
+// drawn from (no digits or punctuation, per the spec's "16 位随机大小写字母").
+const tokenAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// GenerateToken returns a fresh random TokenLength-character token of mixed-case
+// ASCII letters, drawn from crypto/rand. It uses rejection sampling so every
+// letter is equally likely (a plain byte % 52 would bias the first few letters).
+// Callers that need cross-account uniqueness regenerate on the rare collision;
+// the 52^16 space makes that astronomically unlikely, but the store/engine still
+// check to be safe.
+func GenerateToken() (string, error) {
+	// Largest multiple of the alphabet size that fits in a byte; bytes at or
+	// above it are rejected so the modulo below is unbiased.
+	const max = 256 - (256 % len(tokenAlphabet))
+	out := make([]byte, TokenLength)
+	buf := make([]byte, 1)
+	for i := 0; i < TokenLength; {
+		if _, err := rand.Read(buf); err != nil {
+			return "", fmt.Errorf("read random token: %w", err)
+		}
+		if int(buf[0]) >= max {
+			continue // reject to avoid modulo bias
+		}
+		out[i] = tokenAlphabet[int(buf[0])%len(tokenAlphabet)]
+		i++
+	}
+	return string(out), nil
 }
 
 // NormalizeName trims and validates an account name for use in nft object ids.

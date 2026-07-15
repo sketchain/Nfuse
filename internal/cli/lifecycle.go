@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sketchain/nfuse/internal/engine"
+	"github.com/sketchain/nfuse/internal/httpapi"
 	"github.com/sketchain/nfuse/internal/nft"
 	"github.com/sketchain/nfuse/internal/rpc"
 	"github.com/sketchain/nfuse/internal/store"
@@ -20,9 +21,15 @@ import (
 // serverOpts carries the daemon configuration parsed from `nfuse server` flags.
 type serverOpts struct {
 	socket, iface, table, dbPath string
+	httpAddr                     string
 	sampleIvl, persistIvl        time.Duration
 	skipKernChk                  bool
 }
+
+// DefaultHTTPAddr is where the HTTP query endpoint binds unless overridden with
+// --http-addr. It defaults to loopback so the endpoint is local-only until the
+// operator deliberately opens it (e.g. --http-addr 0.0.0.0:8787).
+const DefaultHTTPAddr = "127.0.0.1:8787"
 
 // runServer is the daemon role (formerly `nfuse --rpc`): it owns nft and SQLite,
 // runs the engine, and serves RPCs. It is what systemd keeps running. The
@@ -38,6 +45,7 @@ func (a *App) runServer(args []string) int {
 		sampleIvl   = fs.Duration("sample-interval", 2*time.Second, "kernel counter sampling interval")
 		persistIvl  = fs.Duration("persist-interval", 15*time.Second, "SQLite persistence interval")
 		skipKernChk = fs.Bool("skip-kernel-check", false, "skip the netdev egress kernel version check")
+		httpAddr    = fs.String("http-addr", DefaultHTTPAddr, "HTTP query endpoint address (empty disables it)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -49,7 +57,7 @@ func (a *App) runServer(args []string) int {
 		return 1
 	}
 	return runServerDaemon(logger, serverOpts{
-		socket: *socket, iface: *iface, table: *table, dbPath: *dbPath,
+		socket: *socket, iface: *iface, table: *table, dbPath: *dbPath, httpAddr: *httpAddr,
 		sampleIvl: *sampleIvl, persistIvl: *persistIvl, skipKernChk: *skipKernChk,
 	})
 }
@@ -199,8 +207,29 @@ func runServerDaemon(logger *log.Logger, o serverOpts) int {
 	}
 	defer srv.Close()
 
+	// HTTP query endpoint: only the server role starts it, and only when an
+	// address is configured (--http-addr ""). Bind failures are fatal here — same
+	// as the RPC socket — so a misconfigured address is caught at startup.
+	var httpSrv *httpapi.Server
+	if o.httpAddr != "" {
+		httpSrv = httpapi.New(ctrl, logger.Printf)
+		if err := httpSrv.Listen(o.httpAddr); err != nil {
+			logger.Printf("http listen: %v", err)
+			return 1
+		}
+		defer httpSrv.Close()
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve() }()
+	if httpSrv != nil {
+		go func() {
+			if err := httpSrv.Serve(); err != nil {
+				logger.Printf("http serve: %v", err)
+			}
+		}()
+		logger.Printf("nfuse http query endpoint listening on %s", o.httpAddr)
+	}
 	logger.Printf("nfuse daemon listening on %s (iface %s); press Ctrl-C to stop", o.socket, o.iface)
 
 	sig := make(chan os.Signal, 1)

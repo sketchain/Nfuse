@@ -218,3 +218,21 @@ func (c *Client) SetUsage(id int64, usedBytes uint64) error {
 func (c *Client) ForcePersist() error {
 	return c.call(MethodForcePersist, nil, nil)
 }
+
+func (c *Client) RegenerateToken(id int64) (string, error) {
+	var res TokenResult
+	err := c.call(MethodRegenToken, RegenTokenParams{ID: id}, &res)
+	return res.Token, err
+}
+
+func (c *Client) MasterToken() (string, error) {
+	var res TokenResult
+	err := c.call(MethodGetMasterToken, nil, &res)
+	return res.Token, err
+}
+
+func (c *Client) RegenerateMasterToken() (string, error) {
+	var res TokenResult
+	err := c.call(MethodRegenMasterToken, nil, &res)
+	return res.Token, err
+}

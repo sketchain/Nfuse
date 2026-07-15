@@ -65,7 +65,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     limit_gib          REAL NOT NULL DEFAULT 0,
     billing_anchor_day INTEGER NOT NULL DEFAULT 1,
     used_bytes         INTEGER NOT NULL DEFAULT 0,
-    last_reset_unix    INTEGER NOT NULL DEFAULT 0
+    last_reset_unix    INTEGER NOT NULL DEFAULT 0,
+    token              TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ports (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +89,119 @@ CREATE TABLE IF NOT EXISTS counters (
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
 	}
-	return s.migratePortRange()
+	if err := s.migratePortRange(); err != nil {
+		return err
+	}
+	return s.ensureTokens()
+}
+
+// masterTokenKey is the meta-table key under which the master query token lives.
+const masterTokenKey = "master_token"
+
+// ensureTokens brings a pre-token database up to the token schema and guarantees
+// that every account has a query token and that a master token exists. It is the
+// legacy-compatibility path required by the spec ("旧数据无 token 字段时要能平滑
+// 迁移… 首次加载时自动生成，不能破坏现有数据"):
+//
+//   - Older databases created the accounts table without a `token` column; add it
+//     (defaulting to the empty string) without disturbing any existing row.
+//   - Every account whose token is still empty (freshly added column, or a row
+//     that predates tokens) gets a freshly generated, collision-checked token.
+//   - The single master token is generated if the meta table doesn't hold one yet.
+//
+// The whole step is idempotent: on a database that already has tokens the ALTER
+// is skipped, no account has an empty token, and the master token already exists,
+// so nothing is rewritten and no existing data is touched.
+func (s *Store) ensureTokens() error {
+	hasToken, err := s.columnExists("accounts", "token")
+	if err != nil {
+		return err
+	}
+	if !hasToken {
+		if _, err := s.db.Exec(`ALTER TABLE accounts ADD COLUMN token TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+
+	// Collect the tokens already in use so backfilled/master tokens stay unique.
+	used := map[string]bool{}
+	rows, err := s.db.Query(`SELECT token FROM accounts WHERE token != ''`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			rows.Close()
+			return err
+		}
+		used[t] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Ensure the master token exists, keeping it distinct from account tokens.
+	master, err := s.MasterToken()
+	if err != nil {
+		return err
+	}
+	if master == "" {
+		master, err = uniqueToken(used)
+		if err != nil {
+			return err
+		}
+		if err := s.SetMasterToken(master); err != nil {
+			return err
+		}
+	}
+	used[master] = true
+
+	// Backfill any account still missing a token.
+	idRows, err := s.db.Query(`SELECT id FROM accounts WHERE token = ''`)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for idRows.Next() {
+		var id int64
+		if err := idRows.Scan(&id); err != nil {
+			idRows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	idRows.Close()
+	if err := idRows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		t, err := uniqueToken(used)
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE accounts SET token = ? WHERE id = ?`, t, id); err != nil {
+			return err
+		}
+		used[t] = true
+	}
+	return nil
+}
+
+// uniqueToken generates a fresh token not already present in used. The token
+// space is astronomically larger than any account set, so this loop effectively
+// never repeats, but checking keeps token→account lookups unambiguous.
+func uniqueToken(used map[string]bool) (string, error) {
+	for {
+		t, err := model.GenerateToken()
+		if err != nil {
+			return "", err
+		}
+		if !used[t] {
+			return t, nil
+		}
+	}
 }
 
 // migratePortRange brings a pre-range database up to the [port, "end"] schema.
@@ -135,13 +252,13 @@ func (s *Store) columnExists(table, column string) (bool, error) {
 func (s *Store) Load() (model.Snapshot, error) {
 	snap := model.Snapshot{Counters: map[model.CounterKey]model.Counter{}}
 
-	rows, err := s.db.Query(`SELECT id, name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix FROM accounts ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id, name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix, token FROM accounts ORDER BY id`)
 	if err != nil {
 		return snap, err
 	}
 	for rows.Next() {
 		var a model.Account
-		if err := rows.Scan(&a.ID, &a.Name, &a.Tier, &a.LimitGiB, &a.BillingAnchorDay, &a.UsedBytes, &a.LastResetUnix); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Tier, &a.LimitGiB, &a.BillingAnchorDay, &a.UsedBytes, &a.LastResetUnix, &a.Token); err != nil {
 			rows.Close()
 			return snap, err
 		}
@@ -188,16 +305,47 @@ func (s *Store) Load() (model.Snapshot, error) {
 	return snap, crows.Err()
 }
 
-// CreateAccount inserts a new account and returns its id.
+// CreateAccount inserts a new account and returns its id. The caller supplies the
+// query token (the engine generates a unique one before calling); an empty token
+// is accepted for legacy/test callers and is backfilled by ensureTokens on the
+// next Open.
 func (s *Store) CreateAccount(a model.Account) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO accounts (name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix)
-		 VALUES (?, ?, ?, ?, 0, ?)`,
-		a.Name, string(a.Tier), a.LimitGiB, a.BillingAnchorDay, time.Now().Unix())
+		`INSERT INTO accounts (name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix, token)
+		 VALUES (?, ?, ?, ?, 0, ?, ?)`,
+		a.Name, string(a.Tier), a.LimitGiB, a.BillingAnchorDay, time.Now().Unix(), a.Token)
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// SetToken overwrites an account's query token (used when regenerating).
+func (s *Store) SetToken(id int64, token string) error {
+	_, err := s.db.Exec(`UPDATE accounts SET token = ? WHERE id = ?`, token, id)
+	return err
+}
+
+// MasterToken returns the master query token, or "" if none has been set yet.
+func (s *Store) MasterToken() (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, masterTokenKey).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
+// SetMasterToken stores (or replaces) the master query token.
+func (s *Store) SetMasterToken(token string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		masterTokenKey, token)
+	return err
 }
 
 // DeleteAccount removes an account (cascading to its ports and counters).

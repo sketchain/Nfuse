@@ -30,6 +30,10 @@ const (
 	MethodResetAccount = "ResetAccount"
 	MethodSetUsage     = "SetUsage"
 	MethodForcePersist = "ForcePersist"
+	// Token management (HTTP query tokens).
+	MethodRegenToken       = "RegenerateToken"
+	MethodGetMasterToken   = "GetMasterToken"
+	MethodRegenMasterToken = "RegenerateMasterToken"
 )
 
 // Request is one newline-delimited JSON call from client to server.
@@ -106,6 +110,11 @@ type SetUsageParams struct {
 	UsedBytes uint64 `json:"used_bytes"`
 }
 
+// RegenTokenParams carries the account whose query token is regenerated.
+type RegenTokenParams struct {
+	ID int64 `json:"id"`
+}
+
 // ── Results ──────────────────────────────────────────────────────────────────
 
 // StateResult is the full snapshot returned by GetState: the same account/port/
@@ -118,6 +127,12 @@ type StateResult struct {
 // AddAccountResult carries the id of the newly created account.
 type AddAccountResult struct {
 	ID int64 `json:"id"`
+}
+
+// TokenResult carries a single query token (an account's or the master token),
+// returned by GetMasterToken / RegenerateToken / RegenerateMasterToken.
+type TokenResult struct {
+	Token string `json:"token"`
 }
 
 // HealthResult answers GetHealth: liveness and operational metadata.

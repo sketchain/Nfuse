@@ -16,6 +16,7 @@
 package engine
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"sync"
 	"time"
@@ -33,13 +34,14 @@ type Controller struct {
 	sampleInterval  time.Duration
 	persistInterval time.Duration
 
-	mu          sync.Mutex // guards snap, live, lastPersist, gen
+	mu          sync.Mutex // guards snap, live, lastPersist, gen, masterToken
 	snap        model.Snapshot
 	live        nft.Sample // latest kernel reading
 	logf        func(string, ...any)
 	lastErr     string
 	startedAt   time.Time // process start (for health uptime)
 	lastPersist time.Time // last successful SQLite snapshot
+	masterToken string    // HTTP query token that returns every account
 
 	// gen is a monotonic generation counter, bumped whenever a mutation changes
 	// the kernel's expected quota/counter values (reconcile, ResetAccount,
@@ -85,6 +87,13 @@ func New(st *store.Store, mgr nft.Manager, opts Options) (*Controller, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
 	}
+	// The master token is created/backfilled by the store's migration, so it is
+	// present by the time the engine loads it here.
+	master, err := st.MasterToken()
+	if err != nil {
+		return nil, fmt.Errorf("load master token: %w", err)
+	}
+	c.masterToken = master
 	c.live = nft.Sample{Counters: map[model.CounterKey]model.Counter{}, AccountUsed: map[int64]uint64{}}
 
 	// Cold start vs hot restart: probe whether our kernel table already exists.
@@ -363,13 +372,123 @@ func (c *Controller) AddAccount(name string, tier model.Tier, limitGiB float64, 
 	}
 	var newID int64
 	err = c.reconcile(func() error {
+		// Generate the query token inside the reconcile closure, where c.mu is held
+		// and c.snap is the serialized truth, so the uniqueness check races nothing.
+		token, err := c.uniqueTokenLocked()
+		if err != nil {
+			return err
+		}
 		id, err := c.store.CreateAccount(model.Account{
-			Name: name, Tier: tier, LimitGiB: limitGiB, BillingAnchorDay: anchorDay,
+			Name: name, Tier: tier, LimitGiB: limitGiB, BillingAnchorDay: anchorDay, Token: token,
 		})
 		newID = id
 		return err
 	})
 	return newID, err
+}
+
+// uniqueTokenLocked returns a fresh query token distinct from every account
+// token and the master token. The caller must hold c.mu (reconcile, or the
+// regenerate paths), so the view of existing tokens is consistent.
+func (c *Controller) uniqueTokenLocked() (string, error) {
+	used := make(map[string]bool, len(c.snap.Accounts)+1)
+	if c.masterToken != "" {
+		used[c.masterToken] = true
+	}
+	for _, a := range c.snap.Accounts {
+		if a.Token != "" {
+			used[a.Token] = true
+		}
+	}
+	for {
+		t, err := model.GenerateToken()
+		if err != nil {
+			return "", err
+		}
+		if !used[t] {
+			return t, nil
+		}
+	}
+}
+
+// RegenerateToken issues a fresh query token for an account and returns it. A
+// token change does not affect the kernel ruleset, so this takes a lighter path
+// than reconcile: it updates SQLite and the in-memory account under c.mu without
+// resampling or rebuilding the nft table. The old token stops working at once.
+func (c *Controller) RegenerateToken(id int64) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx := -1
+	for i := range c.snap.Accounts {
+		if c.snap.Accounts[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return "", fmt.Errorf("account %d not found", id)
+	}
+	token, err := c.uniqueTokenLocked()
+	if err != nil {
+		return "", err
+	}
+	if err := c.store.SetToken(id, token); err != nil {
+		return "", err
+	}
+	c.snap.Accounts[idx].Token = token
+	return token, nil
+}
+
+// MasterToken returns the master query token (the one that returns every
+// account's usage in a single query).
+func (c *Controller) MasterToken() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.masterToken
+}
+
+// RegenerateMasterToken issues a fresh master query token and returns it. Like
+// RegenerateToken it bypasses reconcile — no kernel state is involved.
+func (c *Controller) RegenerateMasterToken() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	token, err := c.uniqueTokenLocked()
+	if err != nil {
+		return "", err
+	}
+	if err := c.store.SetMasterToken(token); err != nil {
+		return "", err
+	}
+	c.masterToken = token
+	return token, nil
+}
+
+// QueryByToken resolves an HTTP query token to the account views it grants
+// access to. The master token returns every account (all == true); an account
+// token returns just that account. ok is false for an empty or unknown token.
+// The comparison is constant-time to avoid leaking token bytes through timing.
+func (c *Controller) QueryByToken(token string) (views []AccountView, all bool, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if token == "" {
+		return nil, false, false
+	}
+	if c.masterToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(c.masterToken)) == 1 {
+		return c.viewLocked(), true, true
+	}
+	for _, a := range c.snap.Accounts {
+		if a.Token == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.Token)) == 1 {
+			for _, v := range c.viewLocked() {
+				if v.Account.ID == a.ID {
+					return []AccountView{v}, false, true
+				}
+			}
+		}
+	}
+	return nil, false, false
 }
 
 // DeleteAccount removes an account. When cascade is false it refuses an account
@@ -634,7 +753,12 @@ type AccountView struct {
 func (c *Controller) View() ([]AccountView, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.viewLocked(), c.lastErr
+}
 
+// viewLocked builds the merged desired-state + live-sample view. The caller must
+// hold c.mu. It backs both View (for the TUI/RPC) and QueryByToken (for HTTP).
+func (c *Controller) viewLocked() []AccountView {
 	views := make([]AccountView, 0, len(c.snap.Accounts))
 	for _, a := range c.snap.Accounts {
 		av := AccountView{Account: a}
@@ -656,7 +780,7 @@ func (c *Controller) View() ([]AccountView, string) {
 		}
 		views = append(views, av)
 	}
-	return views, c.lastErr
+	return views
 }
 
 // Teardown removes the kernel ruleset (used on --teardown; DB is untouched).

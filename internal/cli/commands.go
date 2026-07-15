@@ -27,6 +27,9 @@ type opClient interface {
 	ResetAccount(id int64) error
 	SetUsage(id int64, usedBytes uint64) error
 	ForcePersist() error
+	RegenerateToken(id int64) (string, error)
+	MasterToken() (string, error)
+	RegenerateMasterToken() (string, error)
 	Close() error
 }
 
@@ -429,6 +432,111 @@ func (a *App) cmdPortMove(args []string) int {
 			return err
 		}
 		fmt.Fprintf(a.Stdout, "moved port %d to account %d\n", portID, acctID)
+		return nil
+	})
+}
+
+// ── token ────────────────────────────────────────────────────────────────────
+
+func (a *App) cmdToken(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(a.Stderr, "nfuse: token requires a subcommand: show | new | master")
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "show":
+		return a.cmdTokenShow(rest)
+	case "new":
+		return a.cmdTokenNew(rest)
+	case "master":
+		return a.cmdTokenMaster(rest)
+	default:
+		fmt.Fprintf(a.Stderr, "nfuse: unknown token subcommand %q (want: show | new | master)\n", sub)
+		return 2
+	}
+}
+
+// cmdTokenShow prints an account's current query token. The token rides along in
+// the account view, so no dedicated RPC is needed to read it.
+func (a *App) cmdTokenShow(args []string) int {
+	fs := a.newFlagSet("token show")
+	socket := socketFlag(fs)
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if !a.exactArgs(pos, 1, "token show requires an account: nfuse token show <account>") {
+		return 2
+	}
+	ref := arg(pos, 0)
+	return a.withClient(*socket, func(c opClient) error {
+		id, err := resolveAccount(c, ref)
+		if err != nil {
+			return err
+		}
+		accounts, _ := c.View()
+		for _, av := range accounts {
+			if av.Account.ID == id {
+				fmt.Fprintln(a.Stdout, av.Account.Token)
+				return nil
+			}
+		}
+		return fmt.Errorf("account %d not found", id)
+	})
+}
+
+// cmdTokenNew regenerates an account's query token and prints the new value. The
+// old token stops working immediately.
+func (a *App) cmdTokenNew(args []string) int {
+	fs := a.newFlagSet("token new")
+	socket := socketFlag(fs)
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if !a.exactArgs(pos, 1, "token new requires an account: nfuse token new <account>") {
+		return 2
+	}
+	ref := arg(pos, 0)
+	return a.withClient(*socket, func(c opClient) error {
+		id, err := resolveAccount(c, ref)
+		if err != nil {
+			return err
+		}
+		token, err := c.RegenerateToken(id)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(a.Stdout, token)
+		return nil
+	})
+}
+
+// cmdTokenMaster prints the master query token, or regenerates it with --new.
+func (a *App) cmdTokenMaster(args []string) int {
+	fs := a.newFlagSet("token master")
+	socket := socketFlag(fs)
+	regen := fs.Bool("new", false, "regenerate the master token")
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if !a.exactArgs(pos, 0, "token master takes no positional arguments: nfuse token master [--new]") {
+		return 2
+	}
+	return a.withClient(*socket, func(c opClient) error {
+		var token string
+		var err error
+		if *regen {
+			token, err = c.RegenerateMasterToken()
+		} else {
+			token, err = c.MasterToken()
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(a.Stdout, token)
 		return nil
 	})
 }

@@ -22,6 +22,8 @@ type fakeBackend struct {
 	moved       map[int64]int64
 	deleted     []deleteCall
 	persisted   int
+	regenerated []int64
+	masterRegen int
 	started     time.Time
 	lastPersist time.Time
 }
@@ -92,6 +94,20 @@ func (f *fakeBackend) ForcePersist() error {
 	f.persisted++
 	f.lastPersist = time.Now()
 	return nil
+}
+
+func (f *fakeBackend) RegenerateToken(id int64) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.regenerated = append(f.regenerated, id)
+	return "acctTokenReplaced", nil
+}
+func (f *fakeBackend) MasterToken() string { return "masterTokenFixed0" }
+func (f *fakeBackend) RegenerateMasterToken() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.masterRegen++
+	return "masterTokenNewOne", nil
 }
 
 func (f *fakeBackend) Stats() (time.Time, time.Time) {
@@ -178,6 +194,27 @@ func TestClientServerRoundTrip(t *testing.T) {
 	}
 	if be.persisted != 1 {
 		t.Fatalf("persisted = %d, want 1", be.persisted)
+	}
+
+	// Token methods round-trip over the wire.
+	tok, err := cli.RegenerateToken(1)
+	if err != nil {
+		t.Fatalf("RegenerateToken: %v", err)
+	}
+	if tok != "acctTokenReplaced" {
+		t.Fatalf("RegenerateToken = %q, want acctTokenReplaced", tok)
+	}
+	if len(be.regenerated) != 1 || be.regenerated[0] != 1 {
+		t.Fatalf("backend RegenerateToken calls = %+v, want [1]", be.regenerated)
+	}
+	if mt, err := cli.MasterToken(); err != nil || mt != "masterTokenFixed0" {
+		t.Fatalf("MasterToken = %q, %v, want masterTokenFixed0, nil", mt, err)
+	}
+	if nmt, err := cli.RegenerateMasterToken(); err != nil || nmt != "masterTokenNewOne" {
+		t.Fatalf("RegenerateMasterToken = %q, %v", nmt, err)
+	}
+	if be.masterRegen != 1 {
+		t.Fatalf("backend masterRegen = %d, want 1", be.masterRegen)
 	}
 
 	// Health carries the static host facts and a positive uptime.

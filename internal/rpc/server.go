@@ -29,6 +29,9 @@ type Backend interface {
 	ResetAccount(id int64) error
 	SetUsage(id int64, usedBytes uint64) error
 	ForcePersist() error
+	RegenerateToken(id int64) (string, error)
+	MasterToken() string
+	RegenerateMasterToken() (string, error)
 	Stats() (startedAt, lastPersist time.Time)
 }
 
@@ -255,6 +258,27 @@ func (s *Server) dispatch(req Request) Response {
 
 	case MethodForcePersist:
 		return okErr(s.be.ForcePersist())
+
+	case MethodRegenToken:
+		var p RegenTokenParams
+		if err := unmarshal(req.Params, &p); err != nil {
+			return fail(err)
+		}
+		token, err := s.be.RegenerateToken(p.ID)
+		if err != nil {
+			return fail(err)
+		}
+		return ok(TokenResult{Token: token})
+
+	case MethodGetMasterToken:
+		return ok(TokenResult{Token: s.be.MasterToken()})
+
+	case MethodRegenMasterToken:
+		token, err := s.be.RegenerateMasterToken()
+		if err != nil {
+			return fail(err)
+		}
+		return ok(TokenResult{Token: token})
 
 	default:
 		return fail(fmt.Errorf("unknown method %q", req.Method))

@@ -104,6 +104,8 @@ func (a *App) Run(args []string) int {
 		return a.cmdPort(rest)
 	case "persist":
 		return a.cmdPersist(rest)
+	case "token":
+		return a.cmdToken(rest)
 
 	case "-h", "--help", "help":
 		a.usage(a.Stdout)
@@ -180,6 +182,11 @@ Ports:
   port edit   nfuse port edit <port-id> <start[-end]>
   port rm     nfuse port rm   <port-id>
   port move   nfuse port move <port-id> <account>
+
+Tokens (HTTP query, curl <host:port>/<token>):
+  token show   <account>   print an account's query token
+  token new    <account>   regenerate an account's query token
+  token master [--new]     print (or regenerate) the master token
 
 <account> accepts an account name or numeric id; <port-id> is the numeric id
 shown by `+"`nfuse list`"+`. Operational commands share --socket (default `+DefaultSocket+`).

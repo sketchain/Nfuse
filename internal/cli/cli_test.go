@@ -20,16 +20,18 @@ type fakeClient struct {
 	viewErr  string
 
 	// Recorded calls.
-	added      []addCall
-	deleted    []deleteCall
-	setTiers   []setTierCall
-	addedPorts []addPortCall
-	editPorts  []editPortCall
-	delPorts   []int64
-	movePorts  []movePortCall
-	resets     []int64
-	setUsages  []setUsageCall
-	persisted  int
+	added       []addCall
+	deleted     []deleteCall
+	setTiers    []setTierCall
+	addedPorts  []addPortCall
+	editPorts   []editPortCall
+	delPorts    []int64
+	movePorts   []movePortCall
+	resets      []int64
+	setUsages   []setUsageCall
+	persisted   int
+	regenTokens []int64
+	regenMaster int
 
 	// Optional canned error for the next mutation.
 	mutErr error
@@ -112,6 +114,26 @@ func (f *fakeClient) SetUsage(id int64, usedBytes uint64) error {
 func (f *fakeClient) ForcePersist() error {
 	f.persisted++
 	return f.mutErr
+}
+func (f *fakeClient) RegenerateToken(id int64) (string, error) {
+	if f.mutErr != nil {
+		return "", f.mutErr
+	}
+	f.regenTokens = append(f.regenTokens, id)
+	return "NewTokenAbcdEfgh", nil
+}
+func (f *fakeClient) MasterToken() (string, error) {
+	if f.mutErr != nil {
+		return "", f.mutErr
+	}
+	return "MasterTokenAbcdEf", nil
+}
+func (f *fakeClient) RegenerateMasterToken() (string, error) {
+	if f.mutErr != nil {
+		return "", f.mutErr
+	}
+	f.regenMaster++
+	return "MasterTokenNewAbc", nil
 }
 func (f *fakeClient) Close() error { f.closed = true; return nil }
 
@@ -248,6 +270,74 @@ func TestDispatchRoutesOperations(t *testing.T) {
 			}
 			tc.check(t, fc)
 		})
+	}
+}
+
+// ── token commands ───────────────────────────────────────────────────────────
+
+func TestTokenShow(t *testing.T) {
+	accts := sampleAccounts()
+	accts[0].Account.Token = "aliceTokenABCDEFG"
+	fc := &fakeClient{accounts: accts}
+	app, out, errb := newTestApp(fc)
+	if code := app.Run([]string{"token", "show", "alice"}); code != 0 {
+		t.Fatalf("token show exit = %d (stderr %q), want 0", code, errb.String())
+	}
+	if strings.TrimSpace(out.String()) != "aliceTokenABCDEFG" {
+		t.Errorf("token show output = %q, want the account token", out.String())
+	}
+}
+
+func TestTokenNew(t *testing.T) {
+	fc := &fakeClient{accounts: sampleAccounts()}
+	app, out, errb := newTestApp(fc)
+	if code := app.Run([]string{"token", "new", "alice"}); code != 0 {
+		t.Fatalf("token new exit = %d (stderr %q), want 0", code, errb.String())
+	}
+	if len(fc.regenTokens) != 1 || fc.regenTokens[0] != 1 {
+		t.Errorf("token new not routed to account 1: %+v", fc.regenTokens)
+	}
+	if strings.TrimSpace(out.String()) != "NewTokenAbcdEfgh" {
+		t.Errorf("token new output = %q, want the fresh token", out.String())
+	}
+}
+
+func TestTokenMasterShow(t *testing.T) {
+	fc := &fakeClient{accounts: sampleAccounts()}
+	app, out, _ := newTestApp(fc)
+	if code := app.Run([]string{"token", "master"}); code != 0 {
+		t.Fatalf("token master exit = %d, want 0", code)
+	}
+	if strings.TrimSpace(out.String()) != "MasterTokenAbcdEf" {
+		t.Errorf("token master output = %q, want the master token", out.String())
+	}
+	if fc.regenMaster != 0 {
+		t.Errorf("token master without --new must not regenerate")
+	}
+}
+
+func TestTokenMasterNew(t *testing.T) {
+	fc := &fakeClient{accounts: sampleAccounts()}
+	app, out, _ := newTestApp(fc)
+	if code := app.Run([]string{"token", "master", "--new"}); code != 0 {
+		t.Fatalf("token master --new exit = %d, want 0", code)
+	}
+	if fc.regenMaster != 1 {
+		t.Errorf("token master --new must regenerate, got %d", fc.regenMaster)
+	}
+	if strings.TrimSpace(out.String()) != "MasterTokenNewAbc" {
+		t.Errorf("token master --new output = %q", out.String())
+	}
+}
+
+func TestTokenUnknownSub(t *testing.T) {
+	fc := &fakeClient{}
+	app, _, errb := newTestApp(fc)
+	if code := app.Run([]string{"token", "frob"}); code != 2 {
+		t.Fatalf("unknown token sub exit = %d, want 2", code)
+	}
+	if !strings.Contains(errb.String(), "unknown token subcommand") {
+		t.Errorf("expected unknown-subcommand error, got %q", errb.String())
 	}
 }
 
