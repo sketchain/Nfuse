@@ -10,6 +10,17 @@ The metering fast path and the breaker are entirely in the kernel; user space
 only samples, persists, resets and reconciles — so if the Go process dies, the
 breaker still holds.
 
+## Installation
+[For International Users] Use the command below to install Nfuse to your system:
+```
+sudo bash <(curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh)
+```
+[For Users in Mainland China] Use the command below to install Nfuse to your system:
+```
+sudo bash <(curl -fsSL https://gitd.uh.ink/https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse_cn.sh)
+```
+
+
 ## Command structure
 
 `nfuse` is a subcommand-driven CLI. The **operational** commands are the
