@@ -2,29 +2,29 @@
 
 set -e
 if [ "$(id -u)" != "0" ]; then
-    echo "请使用 root 运行："
+    echo "Please run this command as root user："
     echo "sudo bash <(curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh)"
     exit 1
 fi
 
-echo "正在检测默认网卡..."
+echo "Detecting default network interface..."
 IFACE=$(ip route | awk '/default/ {print $5; exit}')
 
 if [ -z "$IFACE" ]; then
-    echo "错误：无法检测到默认网卡。"
+    echo "Error: Unable to detect the default network interface!"
     exit 1
 fi
 
-echo "检测到网卡：$IFACE"
-echo "正在下载最新版 Nfuse..."
+echo "Network interface detected：$IFACE"
+echo "Downloading the latest version of Nfuse..."
 wget -O nfuse-amd64.tar.gz https://github.com/sketchain/Nfuse/releases/latest/download/nfuse-amd64.tar.gz
-echo "解压中..."
+echo "Decompressing objects..."
 tar -zxf nfuse-amd64.tar.gz
-echo "安装 Nfuse 中..."
+echo "Installing Nfuse to system..."
 mv nfuse /usr/local/bin/nfuse
 chmod +x /usr/local/bin/nfuse
 
-echo "创建 systemd 服务..."
+echo "Creating systemd config..."
 cat >/etc/systemd/system/nfuse.service <<EOF
 [Unit]
 Description=Nfuse per-port traffic metering and circuit breaker
@@ -41,19 +41,19 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-echo "重新加载 systemd 中..."
+echo "Reloading systemd..."
 systemctl daemon-reload
-echo "正在设置 Nfuse 开机启动并立即启动..."
+echo "Starting Nfuse and making it launch automatically at system startup..."
 systemctl enable --now nfuse
 
 echo
 echo "========================================="
-echo "Nfuse 安装完成！"
-echo "网卡：${IFACE}"
+echo "Nfuse installation complete!"
+echo "Interface：${IFACE}"
 echo
-echo "查看状态："
+echo "To check the program running status:"
 echo "systemctl status nfuse"
 echo
-echo "查看日志："
+echo "To check the logs"
 echo "journalctl -u nfuse -f"
 echo "========================================="
