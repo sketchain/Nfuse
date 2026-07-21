@@ -12,7 +12,9 @@ breaker still holds.
 
 ## Installation
 Use the command below to install Nfuse to your system:
-`sudo bash <(curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh)`
+```
+sudo bash <(curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh)
+```
 
 
 ## Command structure
