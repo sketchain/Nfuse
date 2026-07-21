@@ -3,7 +3,7 @@
 set -e
 if [ "$(id -u)" != "0" ]; then
     echo "请使用 root 运行："
-    echo "sudo bash <(curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse_cn.sh)"
+    echo "sudo bash <(curl -fsSL https://gitd.uh.ink/https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse_cn.sh)"
     exit 1
 fi
 
@@ -17,7 +17,7 @@ fi
 
 echo "检测到网卡：$IFACE"
 echo "正在下载最新版 Nfuse..."
-wget -O nfuse-amd64.tar.gz https://github.com/sketchain/Nfuse/releases/latest/download/nfuse-amd64.tar.gz
+wget -O nfuse-amd64.tar.gz https://gitd.uh.ink/https://github.com/sketchain/Nfuse/releases/latest/download/nfuse-amd64.tar.gz
 echo "解压中..."
 tar -zxf nfuse-amd64.tar.gz
 echo "安装 Nfuse 中..."
