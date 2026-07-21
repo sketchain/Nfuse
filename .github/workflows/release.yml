@@ -5,6 +5,11 @@ name: Release
 on:
   push:
     branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 # Only create a release once tests pass and the binaries build.
