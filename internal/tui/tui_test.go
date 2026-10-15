@@ -181,6 +181,7 @@ func (f *fakeCtrl) DeletePort(portID int64) error {
 func (f *fakeCtrl) MovePort(int64, int64) error  { return nil }
 func (f *fakeCtrl) ResetAccount(int64) error     { return nil }
 func (f *fakeCtrl) SetUsage(int64, uint64) error { return nil }
+func (f *fakeCtrl) SetExpiry(int64, int64) error { return nil }
 
 // oneAccountTwoPorts builds a single monthly account (id 1) owning ports 8080
 // (portID 10) and 9090 (portID 20).

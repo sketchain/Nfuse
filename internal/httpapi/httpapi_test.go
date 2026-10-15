@@ -2,10 +2,12 @@ package httpapi
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sketchain/nfuse/internal/engine"
 	"github.com/sketchain/nfuse/internal/model"
@@ -172,4 +174,28 @@ func readBodyFrom(t *testing.T, v []acctJSON) string {
 		t.Fatalf("marshal: %v", err)
 	}
 	return string(b)
+}
+
+func TestQueryReportsExpiry(t *testing.T) {
+	be := newBackend()
+	exp := time.Date(2026, 12, 31, 0, 0, 0, 0, time.Local).Unix()
+	alice := be.byTok["aliceTokenABCDEFG"]
+	alice.Account.ExpiresUnix = exp
+	alice.Expired = true
+	be.byTok["aliceTokenABCDEFG"] = alice
+
+	resp := do(t, be, http.MethodGet, "/aliceTokenABCDEFG")
+	body, _ := io.ReadAll(resp.Body)
+	if s := string(body); !strings.Contains(s, "expires 2026-12-31") || !strings.Contains(s, "EXPIRED") {
+		t.Errorf("text body should show expiry and EXPIRED, got %q", s)
+	}
+
+	resp = do(t, be, http.MethodGet, "/aliceTokenABCDEFG?format=json")
+	var got []acctJSON
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0].ExpiresUnix != exp || !got[0].Expired {
+		t.Errorf("json = %+v, want expires_unix %d and expired", got, exp)
+	}
 }

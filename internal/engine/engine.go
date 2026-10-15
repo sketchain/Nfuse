@@ -1,6 +1,7 @@
 // Package engine is the user-space control plane: it samples kernel counters and
 // quotas, persists them to SQLite off the sampling path, performs tier-a monthly
-// resets, and reconciles the nftables ruleset whenever accounts/ports change.
+// resets, disables tier a/b accounts when their expiry date passes, and
+// reconciles the nftables ruleset whenever accounts/ports change.
 //
 // Layering (per the spec's kernel/user-space split):
 //
@@ -50,6 +51,19 @@ type Controller struct {
 	// the meantime, a mutation lowered usage while the sample was in flight, so
 	// the sample is stale and discarded to avoid silently reviving old usage.
 	gen uint64
+
+	// expired is the set of account ids rendered as expired (all traffic dropped)
+	// by the most recent Apply. The sync loop compares it against the wall
+	// clock and reconciles as soon as an account's expiry passes, so the kernel
+	// drop is installed within one sample interval of the deadline.
+	expired map[int64]bool
+
+	// unsynced is set when a reconcile wrote its mutation to SQLite but the
+	// kernel apply then failed. c.snap still follows SQLite (the desired state),
+	// and the sync loop keeps retrying the apply until the kernel matches, so a
+	// persisted change — e.g. a passed expiry — can never be silently left
+	// unenforced until the next unrelated mutation or a restart.
+	unsynced bool
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -115,11 +129,34 @@ func New(st *store.Store, mgr nft.Manager, opts Options) (*Controller, error) {
 			return nil, err
 		}
 	}
-	c.snap = snap
-	if err := c.nft.Apply(snap); err != nil {
+	if err := c.applyLocked(&snap); err != nil {
 		return nil, fmt.Errorf("apply initial ruleset: %w", err)
 	}
+	c.snap = snap
 	return c, nil
+}
+
+// applyLocked stamps snap with the current time (so expired accounts render as
+// a hard drop), applies it to the kernel and records which accounts it rendered
+// as expired. The caller must hold c.mu, or own the not-yet-shared Controller.
+func (c *Controller) applyLocked(snap *model.Snapshot) error {
+	snap.Now = time.Now()
+	if err := c.nft.Apply(*snap); err != nil {
+		return err
+	}
+	c.expired = expiredSet(*snap)
+	return nil
+}
+
+// expiredSet returns the ids of the accounts that are expired at snap.Now.
+func expiredSet(snap model.Snapshot) map[int64]bool {
+	set := map[int64]bool{}
+	for _, a := range snap.Accounts {
+		if a.ExpiredAt(snap.Now) {
+			set[a.ID] = true
+		}
+	}
+	return set
 }
 
 // adoptLiveState samples the live kernel counters/quotas (hot restart) and folds
@@ -156,6 +193,8 @@ func (c *Controller) Start() {
 	go c.sampleLoop()
 	c.wg.Add(1)
 	go c.persistLoop()
+	c.wg.Add(1)
+	go c.syncLoop()
 }
 
 // Stop halts background loops (and performs a final persist).
@@ -344,10 +383,16 @@ func (c *Controller) reconcile(mutate func() error) error {
 	if err := snap.Validate(); err != nil {
 		return err
 	}
-	if err := c.nft.Apply(snap); err != nil {
-		return fmt.Errorf("apply: %w", err)
+	if err := c.applyLocked(&snap); err != nil {
+		// The mutation is already in SQLite. Keep the in-memory desired state in
+		// step with it and let syncLoop retry the kernel apply, rather than leave
+		// c.snap describing a state the database no longer holds.
+		c.snap = snap
+		c.unsynced = true
+		return fmt.Errorf("apply (change saved; the kernel apply will be retried): %w", err)
 	}
 	c.snap = snap
+	c.unsynced = false
 	// This rebuild reseeded the kernel's quota/counter values, so any sample the
 	// sampleLoop took before now is stale: bump the generation to discard it.
 	c.gen++
@@ -529,6 +574,75 @@ func (c *Controller) SetTier(id int64, tier model.Tier, limitGiB float64, anchor
 	// account a/b → c only *pauses* metering; moving back revives the historical
 	// usage and re-seeds it into the kernel quota. Use ResetAccount to zero it.
 	return c.reconcile(func() error { return c.store.SetTier(id, tier, limitGiB, anchorDay) })
+}
+
+// SetExpiry sets the time (unix seconds) at which a tier a/b account is
+// automatically disabled, or clears it with 0. Once the time passes, every
+// packet on the account's ports is dropped in-kernel; setting a time in the past
+// disables the account immediately, and moving the expiry into the future (or
+// clearing it) re-enables it with its usage intact.
+func (c *Controller) SetExpiry(id int64, expiresUnix int64) error {
+	if expiresUnix < 0 {
+		return fmt.Errorf("invalid expiry %d", expiresUnix)
+	}
+	return c.reconcile(func() error {
+		acct, ok := c.snap.Account(id)
+		if !ok {
+			return fmt.Errorf("account %d not found", id)
+		}
+		if expiresUnix != 0 && !acct.Tier.HasQuota() {
+			return fmt.Errorf("account %q is unlimited (tier c); only tier a/b accounts can expire", acct.Name)
+		}
+		return c.store.SetExpiry(id, expiresUnix)
+	})
+}
+
+// syncLoop keeps the kernel ruleset in step with the desired state over time:
+// it reconciles when an account's expiry passes (or, after a clock jump,
+// un-passes), and retries a reconcile whose kernel apply failed. The check is a
+// cheap in-memory comparison; a reconcile only happens when one is needed.
+func (c *Controller) syncLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(c.sampleInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-t.C:
+			c.syncKernel()
+		}
+	}
+}
+
+// syncKernel re-applies the ruleset if the kernel is behind the desired state:
+// a previous apply failed, or the set of expired accounts at the current time
+// differs from what the kernel was last given.
+func (c *Controller) syncKernel() {
+	now := time.Now()
+	c.mu.Lock()
+	var newly []string
+	changed := c.unsynced
+	for _, a := range c.snap.Accounts {
+		exp := a.ExpiredAt(now)
+		if exp != c.expired[a.ID] {
+			changed = true
+			if exp {
+				newly = append(newly, a.Name)
+			}
+		}
+	}
+	c.mu.Unlock()
+	if !changed {
+		return
+	}
+	if err := c.reconcile(func() error { return nil }); err != nil {
+		c.logf("kernel resync: %v", err)
+		return
+	}
+	for _, name := range newly {
+		c.logf("account %q expired; its ports are now blocked", name)
+	}
 }
 
 // AddPort attaches a port (or a contiguous range) to an account, creating its
@@ -745,7 +859,10 @@ type PortView struct {
 type AccountView struct {
 	Account   model.Account
 	UsedBytes uint64 // live quota used (tier a/b) or summed counters (tier c)
-	Ports     []PortView
+	// Expired reports that the kernel is currently blocking the account because
+	// its expiry passed (see Controller.SetExpiry).
+	Expired bool
+	Ports   []PortView
 }
 
 // Snapshot returns a consistent view for rendering. It merges the desired-state
@@ -761,7 +878,7 @@ func (c *Controller) View() ([]AccountView, string) {
 func (c *Controller) viewLocked() []AccountView {
 	views := make([]AccountView, 0, len(c.snap.Accounts))
 	for _, a := range c.snap.Accounts {
-		av := AccountView{Account: a}
+		av := AccountView{Account: a, Expired: c.expired[a.ID]}
 		var sum uint64
 		for _, p := range c.snap.PortsFor(a.ID) {
 			in := c.live.Counters[model.CounterKey{PortID: p.ID, Dir: model.DirIn}].Bytes

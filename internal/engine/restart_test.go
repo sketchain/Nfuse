@@ -17,9 +17,15 @@ type fakeMgr struct {
 	sample  nft.Sample
 	applied []model.Snapshot
 	sampled int
+	// applyErr, when set, makes Apply fail without recording anything (a
+	// transient nft/netlink error).
+	applyErr error
 }
 
 func (m *fakeMgr) Apply(s model.Snapshot) error {
+	if m.applyErr != nil {
+		return m.applyErr
+	}
 	// Deep-copy the account slice so later mutations don't rewrite history.
 	cp := s
 	cp.Accounts = append([]model.Account(nil), s.Accounts...)

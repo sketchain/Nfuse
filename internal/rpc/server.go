@@ -28,6 +28,7 @@ type Backend interface {
 	MovePort(portID, newAccountID int64) error
 	ResetAccount(id int64) error
 	SetUsage(id int64, usedBytes uint64) error
+	SetExpiry(id int64, expiresUnix int64) error
 	ForcePersist() error
 	RegenerateToken(id int64) (string, error)
 	MasterToken() string
@@ -255,6 +256,13 @@ func (s *Server) dispatch(req Request) Response {
 			return fail(err)
 		}
 		return okErr(s.be.SetUsage(p.ID, p.UsedBytes))
+
+	case MethodSetExpiry:
+		var p SetExpiryParams
+		if err := unmarshal(req.Params, &p); err != nil {
+			return fail(err)
+		}
+		return okErr(s.be.SetExpiry(p.ID, p.ExpiresUnix))
 
 	case MethodForcePersist:
 		return okErr(s.be.ForcePersist())

@@ -150,13 +150,15 @@ type portJSON struct {
 }
 
 type acctJSON struct {
-	Name       string     `json:"name"`
-	Tier       string     `json:"tier"`
-	LimitGiB   float64    `json:"limit_gib"`
-	LimitBytes uint64     `json:"limit_bytes"`
-	UsedBytes  uint64     `json:"used_bytes"`
-	Breached   bool       `json:"breached"`
-	Ports      []portJSON `json:"ports"`
+	Name        string     `json:"name"`
+	Tier        string     `json:"tier"`
+	LimitGiB    float64    `json:"limit_gib"`
+	LimitBytes  uint64     `json:"limit_bytes"`
+	UsedBytes   uint64     `json:"used_bytes"`
+	Breached    bool       `json:"breached"`
+	ExpiresUnix int64      `json:"expires_unix"` // 0 = never
+	Expired     bool       `json:"expired"`
+	Ports       []portJSON `json:"ports"`
 }
 
 // writeJSON emits the views as a JSON array (always an array, even for a single
@@ -169,14 +171,20 @@ func (s *Server) writeJSON(w http.ResponseWriter, views []engine.AccountView) {
 		for _, p := range av.Ports {
 			ports = append(ports, portJSON{Start: p.Start, End: p.End, InBytes: p.InBytes, OutBytes: p.OutBytes})
 		}
+		var expires int64 // a tier c account's stored expiry is dormant: report never
+		if av.Account.HasExpiry() {
+			expires = av.Account.ExpiresUnix
+		}
 		out = append(out, acctJSON{
-			Name:       av.Account.Name,
-			Tier:       string(av.Account.Tier),
-			LimitGiB:   av.Account.LimitGiB,
-			LimitBytes: av.Account.LimitBytes(),
-			UsedBytes:  av.UsedBytes,
-			Breached:   breached(av),
-			Ports:      ports,
+			Name:        av.Account.Name,
+			Tier:        string(av.Account.Tier),
+			LimitGiB:    av.Account.LimitGiB,
+			LimitBytes:  av.Account.LimitBytes(),
+			UsedBytes:   av.UsedBytes,
+			Breached:    breached(av),
+			ExpiresUnix: expires,
+			Expired:     av.Expired,
+			Ports:       ports,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -202,7 +210,12 @@ func (s *Server) writeText(w http.ResponseWriter, views []engine.AccountView) {
 			fmt.Fprintf(&b, "%s  [%s]  used %s / %s (%.1f%%)",
 				a.Name, a.Tier.Describe(),
 				model.FormatBytes(av.UsedBytes), model.FormatBytes(a.LimitBytes()), pct)
-			if breached(av) {
+			if a.HasExpiry() {
+				fmt.Fprintf(&b, "  expires %s", model.FormatExpiry(a.ExpiresUnix, time.Local))
+			}
+			if av.Expired {
+				b.WriteString("  EXPIRED")
+			} else if breached(av) {
 				b.WriteString("  BREACHED")
 			}
 		} else {

@@ -40,6 +40,7 @@ type Controller interface {
 	MovePort(portID, newAccountID int64) error
 	ResetAccount(id int64) error
 	SetUsage(id int64, usedBytes uint64) error
+	SetExpiry(id int64, expiresUnix int64) error
 }
 
 // UI wires a tview application to a Controller.
@@ -173,6 +174,7 @@ var helpItems = []helpItem{
 	{'t', "tier"},
 	{'r', "reset"},
 	{'u', "set usage"},
+	{'v', "expiry"},
 	{'q', "quit"},
 }
 
@@ -311,7 +313,7 @@ func (u *UI) render() {
 	u.table.Clear()
 	u.rowRef = map[int]rowRef{}
 
-	headers := []string{"OBJECT", "TIER", "PORT", "IN", "OUT", "USED", "LIMIT", "STATUS"}
+	headers := []string{"OBJECT", "TIER", "PORT", "IN", "OUT", "USED", "LIMIT", "EXPIRES", "STATUS"}
 	for c, h := range headers {
 		u.table.SetCell(0, c, tview.NewTableCell(h).
 			SetTextColor(tcell.ColorYellow).
@@ -323,22 +325,28 @@ func (u *UI) render() {
 	for _, av := range views {
 		a := av.Account
 		limit := "—"
+		expires := "—"
 		status := "unlimited"
 		statusColor := tcell.ColorGreen
 		if a.Tier.HasQuota() {
 			limit = model.FormatBytes(a.LimitBytes())
-			if av.UsedBytes >= a.LimitBytes() {
+			expires = model.FormatExpiry(a.ExpiresUnix, time.Local)
+			switch {
+			case av.Expired:
+				status = "EXPIRED"
+				statusColor = tcell.ColorRed
+			case av.UsedBytes >= a.LimitBytes():
 				status = "BREACHED"
 				statusColor = tcell.ColorRed
-			} else {
+			default:
 				status = "ok"
 			}
 		}
 		u.setRow(row, []string{
 			"▸ " + a.Name, a.Tier.Describe(), "",
-			"", "", model.FormatBytes(av.UsedBytes), limit, status,
+			"", "", model.FormatBytes(av.UsedBytes), limit, expires, status,
 		}, tcell.ColorWhite)
-		u.table.GetCell(row, 7).SetTextColor(statusColor)
+		u.table.GetCell(row, 8).SetTextColor(statusColor)
 		u.rowRef[row] = rowRef{kind: rowAccount, accountID: a.ID, account: a}
 		row++
 
@@ -346,7 +354,7 @@ func (u *UI) render() {
 			u.setRow(row, []string{
 				"   port", "", portLabel(p.Start, p.End),
 				model.FormatBytes(p.InBytes), model.FormatBytes(p.OutBytes),
-				"", "", "",
+				"", "", "", "",
 			}, tcell.ColorGray)
 			u.rowRef[row] = rowRef{kind: rowPort, accountID: a.ID, account: a, portID: p.PortID, start: p.Start, end: p.End}
 			row++
@@ -527,6 +535,8 @@ func (u *UI) dispatch(r rune) bool {
 		u.doReset()
 	case 'u':
 		u.formSetUsage()
+	case 'v':
+		u.formSetExpiry()
 	default:
 		return false
 	}
@@ -620,21 +630,79 @@ func (u *UI) formAddAccount() {
 	form.AddDropDown("Tier", tierOptions, 0, nil)
 	form.AddInputField("Limit (GiB)", "10", 12, tview.InputFieldFloat, nil)
 	form.AddInputField("Billing day (1-28)", "1", 6, tview.InputFieldInteger, nil)
+	form.AddInputField(expiryLabel, "", 16, nil, nil)
 	form.AddButton("Create", func() {
 		name := form.GetFormItemByLabel("Name").(*tview.InputField).GetText()
 		tierIdx, _ := form.GetFormItemByLabel("Tier").(*tview.DropDown).GetCurrentOption()
 		tier := tierFromOption(tierIdx)
 		limit, _ := strconv.ParseFloat(form.GetFormItemByLabel("Limit (GiB)").(*tview.InputField).GetText(), 64)
 		anchor, _ := strconv.Atoi(form.GetFormItemByLabel("Billing day (1-28)").(*tview.InputField).GetText())
+		expiresUnix, expErr := model.ParseExpiry(form.GetFormItemByLabel(expiryLabel).(*tview.InputField).GetText(), time.Local)
 		u.closeForm()
-		if _, err := u.ctrl.AddAccount(name, tier, limit, anchor); err != nil {
+		if expErr != nil {
+			u.errf("%v", expErr)
+			return
+		}
+		if expiresUnix != 0 && !tier.HasQuota() {
+			u.errf("only tier a/b accounts can expire")
+			return
+		}
+		id, err := u.ctrl.AddAccount(name, tier, limit, anchor)
+		if err != nil {
 			u.errf("add account: %v", err)
+			return
+		}
+		if expiresUnix != 0 {
+			if err := u.ctrl.SetExpiry(id, expiresUnix); err != nil {
+				u.errf("account added, but setting its expiry failed: %v", err)
+				return
+			}
+		}
+		u.render()
+	})
+	form.AddButton("Cancel", u.closeForm)
+	u.showForm(form, "Add account", 15)
+}
+
+// expiryLabel is the expiry input's label on the add-account and expiry forms.
+const expiryLabel = "Expires (YYYY-MM-DD)"
+
+// formSetExpiry sets or clears the selected tier a/b account's automatic-disable
+// date. A blank value (or "never") clears it; a date already in the past
+// disables the account immediately.
+func (u *UI) formSetExpiry() {
+	ref, ok := u.selected()
+	if !ok {
+		u.errf("select an account first")
+		return
+	}
+	acct := ref.account
+	if !acct.Tier.HasQuota() {
+		u.errf("account %q is unlimited (tier c); only tier a/b accounts can expire", acct.Name)
+		return
+	}
+	cur := ""
+	if acct.HasExpiry() {
+		cur = model.FormatExpiry(acct.ExpiresUnix, time.Local)
+	}
+	form := tview.NewForm()
+	form.AddInputField(expiryLabel, cur, 20, nil, nil)
+	form.AddTextView("", "blank = never; time optional (HH:MM)", 40, 1, true, false)
+	form.AddButton("Apply", func() {
+		expiresUnix, err := model.ParseExpiry(form.GetFormItemByLabel(expiryLabel).(*tview.InputField).GetText(), time.Local)
+		u.closeForm()
+		if err != nil {
+			u.errf("%v", err)
+			return
+		}
+		if err := u.ctrl.SetExpiry(acct.ID, expiresUnix); err != nil {
+			u.errf("set expiry: %v", err)
 			return
 		}
 		u.render()
 	})
 	form.AddButton("Cancel", u.closeForm)
-	u.showForm(form, "Add account", 13)
+	u.showForm(form, "Expiry: "+acct.Name, 10)
 }
 
 func (u *UI) doDeleteAccount() {

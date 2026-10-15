@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     billing_anchor_day INTEGER NOT NULL DEFAULT 1,
     used_bytes         INTEGER NOT NULL DEFAULT 0,
     last_reset_unix    INTEGER NOT NULL DEFAULT 0,
-    token              TEXT NOT NULL DEFAULT ''
+    token              TEXT NOT NULL DEFAULT '',
+    expires_unix       INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -92,7 +93,22 @@ CREATE TABLE IF NOT EXISTS counters (
 	if err := s.migratePortRange(); err != nil {
 		return err
 	}
+	if err := s.migrateExpiry(); err != nil {
+		return err
+	}
 	return s.ensureTokens()
+}
+
+// migrateExpiry adds the expires_unix column to a database created before
+// account expiry existed. The default 0 means "never expires", so every legacy
+// account keeps behaving exactly as before. Idempotent: skipped once present.
+func (s *Store) migrateExpiry() error {
+	has, err := s.columnExists("accounts", "expires_unix")
+	if err != nil || has {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE accounts ADD COLUMN expires_unix INTEGER NOT NULL DEFAULT 0`)
+	return err
 }
 
 // masterTokenKey is the meta-table key under which the master query token lives.
@@ -252,13 +268,13 @@ func (s *Store) columnExists(table, column string) (bool, error) {
 func (s *Store) Load() (model.Snapshot, error) {
 	snap := model.Snapshot{Counters: map[model.CounterKey]model.Counter{}}
 
-	rows, err := s.db.Query(`SELECT id, name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix, token FROM accounts ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id, name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix, token, expires_unix FROM accounts ORDER BY id`)
 	if err != nil {
 		return snap, err
 	}
 	for rows.Next() {
 		var a model.Account
-		if err := rows.Scan(&a.ID, &a.Name, &a.Tier, &a.LimitGiB, &a.BillingAnchorDay, &a.UsedBytes, &a.LastResetUnix, &a.Token); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Tier, &a.LimitGiB, &a.BillingAnchorDay, &a.UsedBytes, &a.LastResetUnix, &a.Token, &a.ExpiresUnix); err != nil {
 			rows.Close()
 			return snap, err
 		}
@@ -311,9 +327,9 @@ func (s *Store) Load() (model.Snapshot, error) {
 // next Open.
 func (s *Store) CreateAccount(a model.Account) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO accounts (name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix, token)
-		 VALUES (?, ?, ?, ?, 0, ?, ?)`,
-		a.Name, string(a.Tier), a.LimitGiB, a.BillingAnchorDay, time.Now().Unix(), a.Token)
+		`INSERT INTO accounts (name, tier, limit_gib, billing_anchor_day, used_bytes, last_reset_unix, token, expires_unix)
+		 VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+		a.Name, string(a.Tier), a.LimitGiB, a.BillingAnchorDay, time.Now().Unix(), a.Token, a.ExpiresUnix)
 	if err != nil {
 		return 0, err
 	}
@@ -359,6 +375,12 @@ func (s *Store) SetTier(id int64, tier model.Tier, limitGiB float64, anchorDay i
 	_, err := s.db.Exec(
 		`UPDATE accounts SET tier = ?, limit_gib = ?, billing_anchor_day = ? WHERE id = ?`,
 		string(tier), limitGiB, anchorDay, id)
+	return err
+}
+
+// SetExpiry sets (or, with 0, clears) an account's automatic-disable time.
+func (s *Store) SetExpiry(id int64, expiresUnix int64) error {
+	_, err := s.db.Exec(`UPDATE accounts SET expires_unix = ? WHERE id = ?`, expiresUnix, id)
 	return err
 }
 

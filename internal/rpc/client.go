@@ -215,6 +215,10 @@ func (c *Client) SetUsage(id int64, usedBytes uint64) error {
 	return c.call(MethodSetUsage, SetUsageParams{ID: id, UsedBytes: usedBytes}, nil)
 }
 
+func (c *Client) SetExpiry(id int64, expiresUnix int64) error {
+	return c.call(MethodSetExpiry, SetExpiryParams{ID: id, ExpiresUnix: expiresUnix}, nil)
+}
+
 func (c *Client) ForcePersist() error {
 	return c.call(MethodForcePersist, nil, nil)
 }

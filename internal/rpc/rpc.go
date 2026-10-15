@@ -29,6 +29,7 @@ const (
 	MethodMovePort     = "MovePort"
 	MethodResetAccount = "ResetAccount"
 	MethodSetUsage     = "SetUsage"
+	MethodSetExpiry    = "SetExpiry"
 	MethodForcePersist = "ForcePersist"
 	// Token management (HTTP query tokens).
 	MethodRegenToken       = "RegenerateToken"
@@ -108,6 +109,13 @@ type ResetAccountParams struct {
 type SetUsageParams struct {
 	ID        int64  `json:"id"`
 	UsedBytes uint64 `json:"used_bytes"`
+}
+
+// SetExpiryParams sets an account's automatic-disable time in unix seconds;
+// ExpiresUnix 0 clears it (never expires).
+type SetExpiryParams struct {
+	ID          int64 `json:"id"`
+	ExpiresUnix int64 `json:"expires_unix"`
 }
 
 // RegenTokenParams carries the account whose query token is regenerated.

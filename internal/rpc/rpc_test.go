@@ -19,6 +19,7 @@ type fakeBackend struct {
 	nextID   int64
 
 	setUsage    map[int64]uint64
+	setExpiry   map[int64]int64
 	moved       map[int64]int64
 	deleted     []deleteCall
 	persisted   int
@@ -37,9 +38,10 @@ type deleteCall struct {
 
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
-		setUsage: map[int64]uint64{},
-		moved:    map[int64]int64{},
-		started:  time.Now().Add(-time.Minute),
+		setUsage:  map[int64]uint64{},
+		setExpiry: map[int64]int64{},
+		moved:     map[int64]int64{},
+		started:   time.Now().Add(-time.Minute),
 	}
 }
 
@@ -85,6 +87,13 @@ func (f *fakeBackend) SetUsage(id int64, usedBytes uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setUsage[id] = usedBytes
+	return nil
+}
+
+func (f *fakeBackend) SetExpiry(id int64, expiresUnix int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setExpiry[id] = expiresUnix
 	return nil
 }
 
@@ -163,6 +172,14 @@ func TestClientServerRoundTrip(t *testing.T) {
 	}
 	if got := be.setUsage[1]; got != 12345 {
 		t.Fatalf("backend SetUsage = %d, want 12345", got)
+	}
+
+	// SetExpiry forwards the unix deadline verbatim (and 0 to clear).
+	if err := cli.SetExpiry(1, 1798675200); err != nil {
+		t.Fatalf("SetExpiry: %v", err)
+	}
+	if got := be.setExpiry[1]; got != 1798675200 {
+		t.Fatalf("backend SetExpiry = %d, want 1798675200", got)
 	}
 
 	// DeleteAccount forwards the cascade flag both ways over the wire.

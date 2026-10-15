@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Tier is the account policy tier.
@@ -101,6 +102,22 @@ type Account struct {
 	// first load (see store.ensureTokens), so this is empty only transiently
 	// during that migration, never in a loaded, live snapshot.
 	Token string
+	// ExpiresUnix is the unix second at which a quota (tier a/b) account is
+	// automatically disabled: from that instant on, every packet on its ports is
+	// dropped in-kernel regardless of remaining quota. 0 means "never expires".
+	// It is ignored for TierUnlimited (like UsedBytes, it is kept, not cleared, on
+	// a switch to tier c, and takes effect again on a switch back to a/b).
+	ExpiresUnix int64
+}
+
+// HasExpiry reports whether the account carries an effective expiry: only quota
+// tiers (a/b) can expire, and 0 means never.
+func (a Account) HasExpiry() bool { return a.Tier.HasQuota() && a.ExpiresUnix > 0 }
+
+// ExpiredAt reports whether the account is disabled by its expiry at time now.
+// A zero now (an unset Snapshot.Now) never counts as expired.
+func (a Account) ExpiredAt(now time.Time) bool {
+	return a.HasExpiry() && !now.IsZero() && now.Unix() >= a.ExpiresUnix
 }
 
 // LimitBytes returns the quota ceiling in bytes (0 for unlimited tiers).
@@ -166,6 +183,10 @@ type Snapshot struct {
 	Accounts []Account
 	Ports    []Port
 	Counters map[CounterKey]Counter // keyed by (PortID, Dir)
+	// Now is the reference time for time-dependent policy (account expiry) when
+	// the snapshot is rendered into a ruleset. The engine stamps it right before
+	// every Apply; the zero value treats no account as expired.
+	Now time.Time
 }
 
 // CounterKey identifies a counter within a Snapshot.
@@ -277,6 +298,52 @@ func GenerateToken() (string, error) {
 		i++
 	}
 	return string(out), nil
+}
+
+// expiryLayouts are the accepted expiry date formats, interpreted in local time.
+// A bare date means 00:00 at the start of that day.
+var expiryLayouts = []string{
+	"2006-01-02",
+	"2006-01-02 15:04",
+	"2006-01-02T15:04",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+}
+
+// ParseExpiry parses a user-supplied expiry ("2026-12-31", optionally with a
+// "15:04" or "15:04:05" time) in loc and returns its unix second. The words
+// "never"/"none" (and "0" or an empty string) clear the expiry and return 0.
+func ParseExpiry(s string, loc *time.Location) (int64, error) {
+	s = strings.TrimSpace(s)
+	switch strings.ToLower(s) {
+	case "", "0", "never", "none":
+		return 0, nil
+	}
+	for _, layout := range expiryLayouts {
+		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
+			if t.Unix() <= 0 {
+				break
+			}
+			return t.Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("invalid expiry %q: want YYYY-MM-DD (optionally with HH:MM), or never", s)
+}
+
+// FormatExpiry renders an expiry unix second in loc: "2026-12-31" for midnight,
+// "2026-12-31 18:30" otherwise, and "never" for 0.
+func FormatExpiry(unix int64, loc *time.Location) string {
+	if unix <= 0 {
+		return "never"
+	}
+	t := time.Unix(unix, 0).In(loc)
+	if t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 {
+		return t.Format("2006-01-02")
+	}
+	if t.Second() == 0 {
+		return t.Format("2006-01-02 15:04")
+	}
+	return t.Format("2006-01-02 15:04:05")
 }
 
 // NormalizeName trims and validates an account name for use in nft object ids.

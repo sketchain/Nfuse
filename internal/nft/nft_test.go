@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sketchain/nfuse/internal/model"
 )
@@ -88,6 +89,42 @@ func TestBuildScript(t *testing.T) {
 	cntIdx := strings.Index(script, `th dport 8080 counter name "p10_in"`)
 	if dropIdx < 0 || cntIdx < 0 || dropIdx > cntIdx {
 		t.Errorf("breaker rule must precede counter rule (drop=%d counter=%d)", dropIdx, cntIdx)
+	}
+}
+
+// TestBuildScriptExpiredAccount: once Snapshot.Now reaches an account's expiry,
+// its ports get a bare drop per direction and no quota/counter rules, while the
+// quota and counter objects stay declared so usage survives a later renewal.
+func TestBuildScriptExpiredAccount(t *testing.T) {
+	m := &execManager{table: "nfuse", iface: "ens5", priority: -500}
+	deadline := time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)
+	snap := model.Snapshot{
+		Accounts: []model.Account{
+			{ID: 1, Name: "expiring", Tier: model.TierOneShot, LimitGiB: 1, UsedBytes: 100, ExpiresUnix: deadline.Unix()},
+		},
+		Ports: []model.Port{{ID: 10, AccountID: 1, Start: 8080, End: 8080}},
+	}
+
+	snap.Now = deadline.Add(-time.Second)
+	live := m.buildScript(snap)
+	if !strings.Contains(live, `th dport 8080 quota name "acct1" drop`) {
+		t.Errorf("before the deadline the account must be metered normally\n%s", live)
+	}
+
+	snap.Now = deadline
+	script := m.buildScript(snap)
+	for _, w := range []string{
+		"add rule netdev nfuse ingress meta l4proto { tcp, udp } th dport 8080 drop\n",
+		"add rule netdev nfuse egress meta l4proto { tcp, udp } th sport 8080 drop\n",
+		"add quota netdev nfuse acct1 { over 1073741824 bytes used 100 bytes }",
+		"add counter netdev nfuse p10_in",
+	} {
+		if !strings.Contains(script, w) {
+			t.Errorf("expired script missing %q\n%s", w, script)
+		}
+	}
+	if strings.Contains(script, `quota name "acct1"`) || strings.Contains(script, `counter name "p10_`) {
+		t.Errorf("expired account must not keep quota/counter rules\n%s", script)
 	}
 }
 

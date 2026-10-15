@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sketchain/nfuse/internal/engine"
 	"github.com/sketchain/nfuse/internal/model"
@@ -29,6 +30,7 @@ type fakeClient struct {
 	movePorts   []movePortCall
 	resets      []int64
 	setUsages   []setUsageCall
+	setExpiries []setExpiryCall
 	persisted   int
 	regenTokens []int64
 	regenMaster int
@@ -70,6 +72,10 @@ type setUsageCall struct {
 	id    int64
 	bytes uint64
 }
+type setExpiryCall struct {
+	id      int64
+	expires int64
+}
 
 func (f *fakeClient) View() ([]engine.AccountView, string) { return f.accounts, f.viewErr }
 func (f *fakeClient) AddAccount(name string, tier model.Tier, limitGiB float64, anchorDay int) (int64, error) {
@@ -109,6 +115,10 @@ func (f *fakeClient) ResetAccount(id int64) error {
 }
 func (f *fakeClient) SetUsage(id int64, usedBytes uint64) error {
 	f.setUsages = append(f.setUsages, setUsageCall{id, usedBytes})
+	return f.mutErr
+}
+func (f *fakeClient) SetExpiry(id int64, expiresUnix int64) error {
+	f.setExpiries = append(f.setExpiries, setExpiryCall{id, expiresUnix})
 	return f.mutErr
 }
 func (f *fakeClient) ForcePersist() error {
@@ -230,6 +240,17 @@ func TestDispatchRoutesOperations(t *testing.T) {
 		{"set-usage", []string{"set-usage", "alice", "12345"}, func(t *testing.T, fc *fakeClient) {
 			if len(fc.setUsages) != 1 || fc.setUsages[0].bytes != 12345 {
 				t.Errorf("set-usage not routed: %+v", fc.setUsages)
+			}
+		}},
+		{"set-expire", []string{"set-expire", "alice", "2026-12-31"}, func(t *testing.T, fc *fakeClient) {
+			want := time.Date(2026, 12, 31, 0, 0, 0, 0, time.Local).Unix()
+			if len(fc.setExpiries) != 1 || fc.setExpiries[0] != (setExpiryCall{1, want}) {
+				t.Errorf("set-expire not routed: %+v", fc.setExpiries)
+			}
+		}},
+		{"set-expire never", []string{"set-expire", "alice", "never"}, func(t *testing.T, fc *fakeClient) {
+			if len(fc.setExpiries) != 1 || fc.setExpiries[0] != (setExpiryCall{1, 0}) {
+				t.Errorf("set-expire never should clear: %+v", fc.setExpiries)
 			}
 		}},
 		{"persist", []string{"persist"}, func(t *testing.T, fc *fakeClient) {
@@ -583,6 +604,86 @@ func TestExtraPositionalArgsRejected(t *testing.T) {
 				t.Errorf("%s: a surplus-argument command must not reach the daemon", tc.name)
 			}
 		})
+	}
+}
+
+// ── expiry ───────────────────────────────────────────────────────────────────
+
+func TestAddWithExpireSetsExpiry(t *testing.T) {
+	fc := &fakeClient{accounts: sampleAccounts()}
+	app, out, errb := newTestApp(fc)
+	code := app.Run([]string{"add", "carol", "--tier", "b", "--limit", "5", "--expire", "2027-01-15 08:30"})
+	if code != 0 {
+		t.Fatalf("add --expire exit = %d (stderr %q), want 0", code, errb.String())
+	}
+	want := time.Date(2027, 1, 15, 8, 30, 0, 0, time.Local).Unix()
+	if len(fc.setExpiries) != 1 || fc.setExpiries[0] != (setExpiryCall{42, want}) {
+		t.Fatalf("expiry not applied to the new account: %+v", fc.setExpiries)
+	}
+	if !strings.Contains(out.String(), "expires 2027-01-15 08:30") {
+		t.Errorf("stdout should confirm the expiry, got %q", out.String())
+	}
+}
+
+func TestAddWithoutExpireSkipsSetExpiry(t *testing.T) {
+	fc := &fakeClient{accounts: sampleAccounts()}
+	app, _, _ := newTestApp(fc)
+	if code := app.Run([]string{"add", "carol", "--tier", "a", "--limit", "5"}); code != 0 {
+		t.Fatalf("add exit = %d, want 0", code)
+	}
+	if len(fc.setExpiries) != 0 {
+		t.Errorf("no --expire must not call SetExpiry: %+v", fc.setExpiries)
+	}
+}
+
+func TestAddExpireRejectsUnlimitedAndBadDate(t *testing.T) {
+	for _, args := range [][]string{
+		{"add", "carol", "--tier", "c", "--expire", "2027-01-01"},
+		{"add", "carol", "--tier", "a", "--limit", "5", "--expire", "2027/01/01"},
+		{"set-expire", "alice", "tomorrow"},
+	} {
+		fc := &fakeClient{accounts: sampleAccounts()}
+		app, _, errb := newTestApp(fc)
+		if code := app.Run(args); code != 2 {
+			t.Errorf("%v exit = %d, want 2", args, code)
+		}
+		if len(fc.added) != 0 || len(fc.setExpiries) != 0 {
+			t.Errorf("%v must fail before any RPC: added=%+v expiries=%+v", args, fc.added, fc.setExpiries)
+		}
+		if errb.Len() == 0 {
+			t.Errorf("%v: expected an error on stderr", args)
+		}
+	}
+}
+
+func TestListShowsExpiry(t *testing.T) {
+	accts := sampleAccounts()
+	exp := time.Date(2026, 12, 31, 0, 0, 0, 0, time.Local).Unix()
+	accts[0].Account.ExpiresUnix = exp
+	accts[0].Expired = true
+	fc := &fakeClient{accounts: accts}
+
+	app, out, _ := newTestApp(fc)
+	if code := app.Run([]string{"list"}); code != 0 {
+		t.Fatalf("list exit = %d, want 0", code)
+	}
+	if s := out.String(); !strings.Contains(s, "expires 2026-12-31") || !strings.Contains(s, "EXPIRED") {
+		t.Errorf("human list should show expiry and EXPIRED, got:\n%s", s)
+	}
+
+	app, out, _ = newTestApp(fc)
+	if code := app.Run([]string{"list", "--json"}); code != 0 {
+		t.Fatalf("list --json exit = %d, want 0", code)
+	}
+	var got []jsonAccount
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("bad JSON: %v", err)
+	}
+	if got[0].ExpiresUnix != exp || !got[0].Expired {
+		t.Errorf("account[0] expiry = %d/%v, want %d/true", got[0].ExpiresUnix, got[0].Expired, exp)
+	}
+	if got[1].ExpiresUnix != 0 || got[1].Expired {
+		t.Errorf("account[1] should never expire, got %d/%v", got[1].ExpiresUnix, got[1].Expired)
 	}
 }
 

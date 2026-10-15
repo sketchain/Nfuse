@@ -238,3 +238,35 @@ func TestFreshDBHasEndColumn(t *testing.T) {
 		t.Fatalf("fresh db range = %+v, want one 60000-60099", snap.Ports)
 	}
 }
+
+// TestMigrateAddsExpiryColumn: a database from before account expiry gains the
+// expires_unix column on Open, every legacy account defaults to "never", and the
+// value round-trips through SetExpiry/Load.
+func TestMigrateAddsExpiryColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	createLegacyDB(t, path)
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open (migrate): %v", err)
+	}
+	defer st.Close()
+	snap, err := st.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := snap.Accounts[0].ExpiresUnix; got != 0 {
+		t.Fatalf("legacy account expiry = %d, want 0 (never)", got)
+	}
+
+	if err := st.SetExpiry(1, 1798675200); err != nil {
+		t.Fatalf("set expiry: %v", err)
+	}
+	snap, err = st.Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := snap.Accounts[0].ExpiresUnix; got != 1798675200 {
+		t.Fatalf("expiry = %d, want 1798675200", got)
+	}
+}

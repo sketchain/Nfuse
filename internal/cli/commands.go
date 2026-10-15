@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sketchain/nfuse/internal/engine"
 	"github.com/sketchain/nfuse/internal/model"
@@ -26,6 +27,7 @@ type opClient interface {
 	MovePort(portID, newAccountID int64) error
 	ResetAccount(id int64) error
 	SetUsage(id int64, usedBytes uint64) error
+	SetExpiry(id int64, expiresUnix int64) error
 	ForcePersist() error
 	RegenerateToken(id int64) (string, error)
 	MasterToken() (string, error)
@@ -120,6 +122,7 @@ func (a *App) cmdAdd(args []string) int {
 	tierStr := fs.String("tier", "", "account tier: a (monthly), b (one-shot), c (unlimited)")
 	limit := fs.Float64("limit", 0, "quota limit in GiB (required for tier a/b, ignored for c)")
 	anchor := fs.Int("anchor", 1, "monthly billing anchor day, 1-28 (tier a)")
+	expire := fs.String("expire", "", "disable the account from this local date on: YYYY-MM-DD [HH:MM] (tier a/b)")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return 2
@@ -137,6 +140,15 @@ func (a *App) cmdAdd(args []string) int {
 		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
 		return 2
 	}
+	expiresUnix, err := model.ParseExpiry(*expire, time.Local)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
+		return 2
+	}
+	if expiresUnix != 0 && !tier.HasQuota() {
+		fmt.Fprintln(a.Stderr, "nfuse: --expire applies only to tier a/b accounts")
+		return 2
+	}
 	return a.withClient(*socket, func(c opClient) error {
 		id, err := c.AddAccount(name, tier, *limit, *anchor)
 		if err != nil {
@@ -148,6 +160,13 @@ func (a *App) cmdAdd(args []string) int {
 			return err
 		}
 		fmt.Fprintf(a.Stdout, "added account %q (id %d)\n", name, id)
+		if expiresUnix != 0 {
+			if err := c.SetExpiry(id, expiresUnix); err != nil {
+				return fmt.Errorf("account %d was added but setting its expiry failed: %w (retry with `nfuse set-expire %d %s`)",
+					id, err, id, *expire)
+			}
+			fmt.Fprintf(a.Stdout, "account %d expires %s\n", id, model.FormatExpiry(expiresUnix, time.Local))
+		}
 		return nil
 	})
 }
@@ -275,6 +294,45 @@ func (a *App) cmdSetUsage(args []string) int {
 			return err
 		}
 		fmt.Fprintf(a.Stdout, "set account %d usage to %d bytes\n", id, usedBytes)
+		return nil
+	})
+}
+
+// ── set-expire ───────────────────────────────────────────────────────────────
+
+func (a *App) cmdSetExpire(args []string) int {
+	fs := a.newFlagSet("set-expire")
+	socket := socketFlag(fs)
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if !a.exactArgs(pos, 2, "set-expire requires an account and a date: nfuse set-expire <account> <YYYY-MM-DD[ HH:MM]|never>") {
+		return 2
+	}
+	ref, when := arg(pos, 0), arg(pos, 1)
+	expiresUnix, err := model.ParseExpiry(when, time.Local)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "nfuse: %v\n", err)
+		return 2
+	}
+	return a.withClient(*socket, func(c opClient) error {
+		id, err := resolveAccount(c, ref)
+		if err != nil {
+			return err
+		}
+		if err := c.SetExpiry(id, expiresUnix); err != nil {
+			return err
+		}
+		if expiresUnix == 0 {
+			fmt.Fprintf(a.Stdout, "cleared expiry of account %d\n", id)
+			return nil
+		}
+		fmt.Fprintf(a.Stdout, "account %d expires %s", id, model.FormatExpiry(expiresUnix, time.Local))
+		if time.Now().Unix() >= expiresUnix {
+			fmt.Fprint(a.Stdout, " (already passed: the account is now disabled)")
+		}
+		fmt.Fprintln(a.Stdout)
 		return nil
 	})
 }
@@ -662,13 +720,17 @@ type jsonPort struct {
 // engine.AccountView. Usage is reported as raw bytes so scripts do the math;
 // the limit is reported in GiB (the model's own unit) and as bytes.
 type jsonAccount struct {
-	ID         int64      `json:"id"`
-	Name       string     `json:"name"`
-	Tier       string     `json:"tier"`
-	LimitGiB   float64    `json:"limit_gib"`
-	LimitBytes uint64     `json:"limit_bytes"`
-	UsedBytes  uint64     `json:"used_bytes"`
-	Ports      []jsonPort `json:"ports"`
+	ID         int64   `json:"id"`
+	Name       string  `json:"name"`
+	Tier       string  `json:"tier"`
+	LimitGiB   float64 `json:"limit_gib"`
+	LimitBytes uint64  `json:"limit_bytes"`
+	UsedBytes  uint64  `json:"used_bytes"`
+	// ExpiresUnix is the automatic-disable time in unix seconds (0 = never);
+	// Expired is true while the account is blocked because it has passed.
+	ExpiresUnix int64      `json:"expires_unix"`
+	Expired     bool       `json:"expired"`
+	Ports       []jsonPort `json:"ports"`
 }
 
 // writeJSON emits the account list as stable JSON on stdout. An empty list is
@@ -681,14 +743,20 @@ func (a *App) writeJSON(accounts []engine.AccountView) error {
 		for _, p := range av.Ports {
 			ports = append(ports, jsonPort{ID: p.PortID, Start: p.Start, End: p.End})
 		}
+		var expires int64 // a tier c account's stored expiry is dormant: report never
+		if av.Account.HasExpiry() {
+			expires = av.Account.ExpiresUnix
+		}
 		out = append(out, jsonAccount{
-			ID:         av.Account.ID,
-			Name:       av.Account.Name,
-			Tier:       string(av.Account.Tier),
-			LimitGiB:   av.Account.LimitGiB,
-			LimitBytes: av.Account.LimitBytes(),
-			UsedBytes:  av.UsedBytes,
-			Ports:      ports,
+			ID:          av.Account.ID,
+			Name:        av.Account.Name,
+			Tier:        string(av.Account.Tier),
+			LimitGiB:    av.Account.LimitGiB,
+			LimitBytes:  av.Account.LimitBytes(),
+			UsedBytes:   av.UsedBytes,
+			ExpiresUnix: expires,
+			Expired:     av.Expired,
+			Ports:       ports,
 		})
 	}
 	enc := json.NewEncoder(a.Stdout)
@@ -711,7 +779,12 @@ func (a *App) writeHuman(accounts []engine.AccountView) {
 			if acct.Tier.Resets() {
 				fmt.Fprintf(a.Stdout, "  anchor day %d", acct.BillingAnchorDay)
 			}
-			if acct.Breached() {
+			if acct.HasExpiry() {
+				fmt.Fprintf(a.Stdout, "  expires %s", model.FormatExpiry(acct.ExpiresUnix, time.Local))
+			}
+			if av.Expired {
+				fmt.Fprint(a.Stdout, "  EXPIRED")
+			} else if acct.Breached() {
 				fmt.Fprint(a.Stdout, "  BREACHED")
 			}
 		} else {

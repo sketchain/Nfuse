@@ -22,12 +22,36 @@ Nfuse 使用 nftables 的 **netdev** 钩子对网卡进行 **按端口、双向*
 
 【国际用户】使用下面的命令将 Nfuse 安装到你的系统：
 ```
-sudo bash <(curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh)
+curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh | sudo bash
 ```
 【中国大陆用户】使用下面的命令将 Nfuse 安装到你的系统：
 ```
-sudo bash <(curl -fsSL https://gitd.uh.ink/https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse_cn.sh)
+curl -fsSL https://gitd.uh.ink/https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse_cn.sh | sudo bash
 ```
+
+> 旧命令 `sudo bash <(curl …)` 在多数发行版上会失败（`/dev/fd/63: No such file or
+> directory`）：sudo 会关闭继承的文件描述符，bash 读不到进程替换。请改用上面的管道写法
+> （已经是 root 时，`bash <(curl …)` 仍然可用）。
+
+安装脚本会：
+
+- 检查 root、Linux、systemd 以及内核 **≥ 5.16**，不满足时直接报错退出；
+- 自动识别 CPU 架构（amd64 / arm64 / armv7 / 386）并下载对应的 Release 包，用
+  `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin/nfuse`——校验文件下载不到或校验不通过时
+  **直接中止**，绝不安装未经验证的二进制；
+- 缺少 `nft` 时通过 apt / dnf / yum / zypper / pacman 自动安装 nftables；
+- 取默认路由（IPv4，没有则 IPv6）所在网卡生成 `/etc/systemd/system/nfuse.service`，
+  并设为开机自启、立即启动；服务启动失败时打印最近日志并以 **非零** 退出（便于自动化判断）。
+
+**指定网卡：** 自动识别不准时用 `NFUSE_IFACE` 指定（`ip -br link` 查看网卡名）：
+
+```
+curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh | sudo NFUSE_IFACE=ens5 bash
+```
+
+**升级：** 重新运行同一条安装命令即可——替换二进制并重启服务，SQLite 数据不受影响。
+已存在的 `nfuse.service` 会被 **保留**（里面可能有你加的 `--http-port` 等参数）；
+只有显式设置了 `NFUSE_IFACE` 时才会重新生成。
 
 
 ## 命令结构
@@ -42,11 +66,12 @@ nfuse teardown             移除内核规则集并退出
 nfuse version              打印版本信息
 
 nfuse list [--json]                账户/端口/用量列表
-nfuse add <name> --tier a|b|c …     添加账户
+nfuse add <name> --tier a|b|c …     添加账户（可加 --expire YYYY-MM-DD）
 nfuse rm <account> [--cascade]      删除账户
 nfuse set-tier <account> --tier …   修改档位 / 限额
 nfuse reset <account>               将账户用量清零
 nfuse set-usage <account> <bytes>   设置账户用量
+nfuse set-expire <account> <date|never>  设置/清除到期停用日期（档位 a/b）
 nfuse persist                       立即强制进行一次 SQLite 快照
 nfuse port add  <account> <start[-end]>
 nfuse port edit <port-id> <start[-end]>
@@ -155,6 +180,38 @@ quota 产生 `drop`，这会终止规则求值——因此 **计数器位于 dro
 有意为之，不是 bug：档位 c 是“暂停计费”，而不是“从头开始”。要真正清零用量，请重置
 账户（`r`）。
 
+### 到期自动停用（档位 a / b）
+
+档位 **a** 和 **b** 的账户可以设置一个 **到期日期**：到了这个时间点，账户被自动停用——
+它的每个端口在两个方向上都换成一条无条件的 `drop` 规则，**不论配额还剩多少**，所有
+流量都被内核丢弃（停用期间不再计量，也不计入配额）。
+
+```sh
+sudo nfuse add vip --tier a --limit 100 --expire 2026-12-31   # 创建时就设好到期日
+sudo nfuse set-expire vip 2027-06-30                          # 续期（改到期日）
+sudo nfuse set-expire vip "2027-06-30 18:00"                  # 精确到时分
+sudo nfuse set-expire vip never                               # 取消到期，永久有效
+```
+
+- **时间语义：** 日期按 **服务器本地时区** 解释，`2026-12-31` 表示 **2026-12-31 00:00
+  起停用**（即可用到 12-30 当天结束）。想让账户用满 12-31 当天，请写 `2027-01-01` 或
+  `"2026-12-31 23:59"`。
+- **立即生效 / 恢复：** 设置一个已经过去的时间会立即停用账户；把到期日改到未来或设为
+  `never` 会立即恢复，**用量与计数器完整保留**（停用时 quota/counter 对象仍然存在，只是
+  不再被规则引用）。
+- **执行方式：** 守护进程每个采样周期（默认 2 秒）检查一次，一旦有账户到期就走同一条
+  原子对账路径重建规则集，因此 drop 规则会在到期后约 2 秒内装进内核。若某次内核应用失败
+  （例如瞬时的 nft/netlink 错误），已保存到 SQLite 的变更不会丢：守护进程会在之后每个
+  周期自动重试，直到内核与期望状态一致。守护进程启动时也会
+  按当前时间渲染规则，所以宕机期间到期的账户在服务恢复的第一时间就被停用。
+- **档位 c 不会到期：** 不限量账户拒绝设置到期日。把一个带到期日的 a/b 账户切到 c 时，
+  到期日会保留但暂不生效（与用量的“暂停”语义一致），切回 a/b 后重新生效。
+- **展示：** `nfuse list` 显示 `expires <日期>`，停用后显示 `EXPIRED`；`--json` 与 HTTP
+  查询的 JSON 增加 `expires_unix`（Unix 秒，`0` 表示永不到期）和 `expired` 字段；TUI
+  增加 `EXPIRES` 列，`STATUS` 显示 `EXPIRED`。
+- **迁移：** 旧数据库首次打开时自动加上 `expires_unix` 列（默认 0 = 永不到期），已有账户
+  行为不变。
+
 ### 持久化与重启回填（SQLite，WAL）
 
 内核 quota/counter 值在重启时 **丢失**。Nfuse 周期性地将每个账户的配额用量和每个
@@ -216,6 +273,7 @@ sudo ./nfuse server --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfus
 
 # 从 shell 管理账户和端口（每条都是发给守护进程的一个 RPC）：
 sudo ./nfuse add web --tier a --limit 100 --anchor 1   # 100 GiB/月，每月 1 号重置
+sudo ./nfuse set-expire web 2026-12-31                 # 2026-12-31 00:00 起自动停用
 sudo ./nfuse port add web 60000-60099                  # 计量一个端口范围
 sudo ./nfuse list                                      # 人类可读列表
 sudo ./nfuse list --json | jq '.[] | {name, used_bytes}'
@@ -251,6 +309,7 @@ sudo ./nfuse teardown                                  # 移除规则集
   {
     "id": 1, "name": "web", "tier": "a",
     "limit_gib": 100, "limit_bytes": 107374182400, "used_bytes": 5368709120,
+    "expires_unix": 1798646400, "expired": false,
     "ports": [ { "id": 7, "start": 60000, "end": 60099 } ]
   }
 ]
@@ -290,7 +349,7 @@ curl http://127.0.0.1:8787/$MTOK           # → 每个账户的用量
   `nfuse token master --new` 轮换主令牌。
 - **输出格式**：纯文本（默认）或通过 `?format=json` 的 JSON（裸 `?json` 也行）。JSON 始终
   是一个数组——账户令牌一个元素，主令牌每个账户一个元素——并将 `used_bytes`/`limit_bytes`
-  报告为原始字节。令牌 **从不** 在响应中回显。
+  报告为原始字节，另带 `expires_unix`（0 = 永不到期）与 `expired`。令牌 **从不** 在响应中回显。
 - **未知或空的令牌** 是 `404`；只接受 `GET`/`HEAD`。
 
 **旧数据库透明迁移。** 在令牌存在之前创建的数据库没有 `token` 列也没有主令牌；守护进程
@@ -321,7 +380,10 @@ WantedBy=multi-user.target
 
 `a` 添加账户 · `d` 删除账户 · `p` 添加端口 · `e` 编辑端口 ·
 `x` 删除端口 · `m` 移动端口 · `t` 修改档位 · `r` 重置配额 ·
-`u` 设置用量 · `q` 退出
+`u` 设置用量 · `v` 到期日期 · `q` 退出
+
+**到期日期（`v`）：** 为选中的 a/b 账户设置或清除到期日（`YYYY-MM-DD`，可带 `HH:MM`；
+留空 = 永不到期）。添加账户（`a`）的表单里也有同样的 “Expires” 输入框。
 
 **添加 / 编辑端口** 接受任一形式——单个端口（`60006`）或范围（`60000-60099`）。`e` 编辑
 选中的端口行：重新编号一个单端口、平移一个范围的边界、或在两者之间转换，并以当前值预填。
@@ -367,12 +429,43 @@ breaker still holds.
 ## Installation
 [For International Users] Use the command below to install Nfuse to your system:
 ```
-sudo bash <(curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh)
+curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh | sudo bash
 ```
 [For Users in Mainland China] Use the command below to install Nfuse to your system:
 ```
-sudo bash <(curl -fsSL https://gitd.uh.ink/https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse_cn.sh)
+curl -fsSL https://gitd.uh.ink/https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse_cn.sh | sudo bash
 ```
+
+> The old `sudo bash <(curl …)` form fails on most distributions
+> (`/dev/fd/63: No such file or directory`): sudo closes inherited file
+> descriptors, so bash can't read the process substitution. Use the pipe form
+> above (`bash <(curl …)` still works if you are already root).
+
+The installer:
+
+- checks for root, Linux, systemd and kernel **≥ 5.16**, and stops with a clear
+  error if any is missing;
+- detects the CPU architecture (amd64 / arm64 / armv7 / 386), downloads the
+  matching release asset, verifies it against `SHA256SUMS.txt` and installs it as
+  `/usr/local/bin/nfuse`. If the checksum file can't be fetched or doesn't
+  match, it **aborts**: an unverified binary is never installed;
+- installs nftables via apt / dnf / yum / zypper / pacman if `nft` is missing;
+- writes `/etc/systemd/system/nfuse.service` for the default-route interface
+  (IPv4, falling back to IPv6), enables it at boot and starts it. If the service
+  fails to start, it prints the recent logs and exits **non-zero**, so automation
+  can tell.
+
+**Choosing the interface:** if auto-detection picks the wrong NIC, set
+`NFUSE_IFACE` (see `ip -br link`):
+
+```
+curl -fsSL https://github.com/sketchain/Nfuse/raw/refs/heads/main/nfuse.sh | sudo NFUSE_IFACE=ens5 bash
+```
+
+**Upgrading:** re-run the same install command. It replaces the binary and
+restarts the service; the SQLite data is untouched. An existing `nfuse.service`
+is **kept** (it may carry flags you added, such as `--http-port`); it is only
+regenerated when `NFUSE_IFACE` is set explicitly.
 
 
 ## Command structure
@@ -388,11 +481,12 @@ nfuse teardown             remove the kernel ruleset and exit
 nfuse version              print version information
 
 nfuse list [--json]                account/port/usage listing
-nfuse add <name> --tier a|b|c …     add an account
+nfuse add <name> --tier a|b|c …     add an account (optionally --expire YYYY-MM-DD)
 nfuse rm <account> [--cascade]      delete an account
 nfuse set-tier <account> --tier …   change tier / limit
 nfuse reset <account>               zero an account's usage
 nfuse set-usage <account> <bytes>   set an account's usage
+nfuse set-expire <account> <date|never>  set/clear the auto-disable date (tier a/b)
 nfuse persist                       force a SQLite snapshot now
 nfuse port add  <account> <start[-end]>
 nfuse port edit <port-id> <start[-end]>
@@ -522,6 +616,47 @@ revives the historical `used_bytes` and re-seeds it into the kernel quota. This
 is intentional, not a bug: tier c is "billing paused", not "start over". To
 actually zero usage, reset the account (`r`).
 
+### Automatic expiry (tiers a / b)
+
+A tier **a** or **b** account can carry an **expiry date**. When it arrives the
+account is disabled automatically: each of its ports gets an unconditional `drop`
+rule in both directions, so the kernel drops all of its traffic **no matter how
+much quota is left**. While disabled, nothing is metered or charged.
+
+```sh
+sudo nfuse add vip --tier a --limit 100 --expire 2026-12-31   # set at creation
+sudo nfuse set-expire vip 2027-06-30                          # renew (move the date)
+sudo nfuse set-expire vip "2027-06-30 18:00"                  # to the minute
+sudo nfuse set-expire vip never                               # remove the expiry
+```
+
+- **Time semantics:** dates are read in the **server's local time zone**, and
+  `2026-12-31` means **disabled from 2026-12-31 00:00**, so the last usable day is
+  12-30. To keep the account through all of 12-31, use `2027-01-01` or
+  `"2026-12-31 23:59"`.
+- **Immediate effect / renewal:** a time already in the past disables the
+  account at once. Moving the date into the future, or setting `never`,
+  re-enables it immediately with **usage and counters intact**: the quota and
+  counter objects stay declared while expired, just unreferenced by any rule.
+- **Enforcement:** the daemon checks once per sample interval (2 s by default).
+  When an account expires it rebuilds the ruleset through the same atomic
+  reconcile path, so the drop is in the kernel within ~2 s of the deadline. If a
+  kernel apply fails (say, a transient nft/netlink error), the change already
+  saved to SQLite is not lost: the daemon retries every interval until the
+  kernel matches.
+  Startup renders the ruleset against the current time too, so an account that
+  expired while the daemon was down is blocked as soon as it comes back.
+- **Tier c never expires:** an unlimited account rejects an expiry. Switching
+  an a/b account that has one to c keeps the date but makes it dormant (like
+  usage, tier c is "paused"); it takes effect again on a switch back to a/b.
+- **Display:** `nfuse list` shows `expires <date>` and, once disabled, `EXPIRED`;
+  the `--json` output and the HTTP JSON gain `expires_unix` (unix seconds,
+  `0` = never) and `expired`; the TUI gains an `EXPIRES` column and shows
+  `EXPIRED` in `STATUS`.
+- **Migration:** an older database gets the `expires_unix` column (default
+  0 = never) the first time it is opened, so existing accounts behave exactly as
+  before.
+
 ### Persistence & reboot backfill (SQLite, WAL)
 
 Kernel quota/counter values are **lost on reboot**. Nfuse periodically snapshots
@@ -589,6 +724,7 @@ sudo ./nfuse server --iface ens5 --db /var/lib/nfuse/nfuse.db --socket /run/nfus
 
 # Manage accounts and ports from the shell (each is one RPC to the daemon):
 sudo ./nfuse add web --tier a --limit 100 --anchor 1   # 100 GiB/month, resets on the 1st
+sudo ./nfuse set-expire web 2026-12-31                 # auto-disable from 2026-12-31 00:00
 sudo ./nfuse port add web 60000-60099                  # meter a port range
 sudo ./nfuse list                                      # human-readable listing
 sudo ./nfuse list --json | jq '.[] | {name, used_bytes}'
@@ -627,6 +763,7 @@ success and non-zero on failure so scripts can branch on it.
   {
     "id": 1, "name": "web", "tier": "a",
     "limit_gib": 100, "limit_bytes": 107374182400, "used_bytes": 5368709120,
+    "expires_unix": 1798646400, "expired": false,
     "ports": [ { "id": 7, "start": 60000, "end": 60099 } ]
   }
 ]
@@ -670,7 +807,7 @@ curl http://127.0.0.1:8787/$MTOK           # → every account's usage
 - **Output formats**: plain text (default) or JSON via `?format=json` (bare `?json`
   works too). The JSON is always an array — one element for an account token, one
   per account for the master token — and reports `used_bytes`/`limit_bytes` as raw
-  bytes. A token is **never** echoed back in a response.
+  bytes, plus `expires_unix` (0 = never) and `expired`. A token is **never** echoed back in a response.
 - An **unknown or empty token** is `404`; only `GET`/`HEAD` are accepted.
 
 **Legacy databases migrate transparently.** A database created before tokens
@@ -704,7 +841,11 @@ retries until it appears — the intended behavior rather than metering the wron
 
 `a` add account · `d` delete account · `p` add port · `e` edit port ·
 `x` delete port · `m` move port · `t` change tier · `r` reset quota ·
-`u` set usage · `q` quit
+`u` set usage · `v` expiry · `q` quit
+
+**Expiry (`v`)** sets or clears the selected a/b account's expiry
+(`YYYY-MM-DD`, optionally `HH:MM`; blank = never). The add-account form (`a`)
+has the same "Expires" field.
 
 **Adding / editing a port** accepts either form — a single port (`60006`) or a
 range (`60000-60099`). `e` edits the selected port row: renumber a single port,

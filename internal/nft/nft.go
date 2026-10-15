@@ -46,6 +46,14 @@
 // rule is never reached — i.e. the counter sits *after* the drop and stops
 // advancing the moment the breaker trips. Unlimited (tier c) accounts get no
 // quota rule and thus never break.
+//
+// Expiry: a tier a/b account whose expiry has passed (Account.ExpiredAt at
+// Snapshot.Now) gets a single unconditional rule per port and direction instead:
+//
+//	meta l4proto {tcp,udp} th dport P drop
+//
+// Its quota and counter objects are still declared (seeded as usual), so usage
+// is preserved and comes back intact if the expiry is later extended or cleared.
 package nft
 
 import (
@@ -185,6 +193,11 @@ func (m *execManager) buildScript(snap model.Snapshot) string {
 				chain = "egress"
 			}
 			match := portMatch(dir, p)
+			if acct.ExpiredAt(snap.Now) {
+				// Expired: block everything; nothing is metered or charged.
+				fmt.Fprintf(&b, "add rule %s %s %s drop\n", tbl, chain, match)
+				continue
+			}
 			if acct.Tier.HasQuota() {
 				fmt.Fprintf(&b, "add rule %s %s %s quota name \"%s\" drop\n",
 					tbl, chain, match, quotaName(acct.ID))

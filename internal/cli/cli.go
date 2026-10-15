@@ -7,7 +7,7 @@
 //
 //	Lifecycle — server (the engine daemon, formerly `--rpc`), tui, teardown,
 //	            version. These own the process role; see lifecycle.go.
-//	Operations — list, add, rm, set-tier, reset, set-usage, port {add,edit,rm,
+//	Operations — list, add, rm, set-tier, reset, set-usage, set-expire, port {add,edit,rm,
 //	            move}, persist. Each is a thin UDS RPC client that maps onto one
 //	            method of rpc.Client; see commands.go.
 //
@@ -100,6 +100,8 @@ func (a *App) Run(args []string) int {
 		return a.cmdReset(rest)
 	case "set-usage":
 		return a.cmdSetUsage(rest)
+	case "set-expire":
+		return a.cmdSetExpire(rest)
 	case "port":
 		return a.cmdPort(rest)
 	case "persist":
@@ -170,11 +172,12 @@ Lifecycle:
 
 Accounts:
   list        list accounts, ports and usage (--json for machine output)
-  add         add an account:       nfuse add <name> --tier a|b|c [--limit GiB] [--anchor 1-28]
+  add         add an account:       nfuse add <name> --tier a|b|c [--limit GiB] [--anchor 1-28] [--expire YYYY-MM-DD]
   rm          delete an account:     nfuse rm <account> [--cascade]
   set-tier    change tier/limit:     nfuse set-tier <account> --tier a|b|c [--limit GiB] [--anchor 1-28]
   reset       zero an account's usage:   nfuse reset <account>
   set-usage   set an account's usage:    nfuse set-usage <account> <bytes>
+  set-expire  auto-disable on a date:    nfuse set-expire <account> <YYYY-MM-DD[ HH:MM]|never>
   persist     force a SQLite snapshot now
 
 Ports:
